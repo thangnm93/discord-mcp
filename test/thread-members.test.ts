@@ -54,16 +54,19 @@ function stubTextChannel(refuse: string[] = []) {
   return Object.assign(created, { added });
 }
 
-/** Discord's refusal of a member change on an archived thread. */
-const archivedError = () =>
+/** An error as Discord's REST API raises it for a member change. */
+const discordError = (code: number, message: string, status = 400) =>
   new DiscordAPIError(
-    { code: 50083, message: "Thread is archived" },
-    50083,
-    400,
+    { code, message },
+    code,
+    status,
     "PUT",
     "https://discord.com/api/v10/channels/x/thread-members/y",
     {},
   );
+
+/** Discord's refusal of a member change on an archived thread. */
+const archivedError = () => discordError(50083, "Thread is archived");
 
 /** A thread channel recording member additions and removals. */
 function stubThread(overrides: Record<string, unknown> = {}) {
@@ -225,18 +228,19 @@ test("remove_thread_member words its result so it is true whether or not the use
   assert.match(textOf(result), new RegExp(`^✅ User ${USER} is not in thread "pair"`));
 });
 
-test("remove_thread_member still surfaces other Discord errors", async () => {
-  stubThread({
-    members: {
-      remove: async () => {
-        throw new Error("Missing Permissions");
-      },
-    },
-  });
-  await assert.rejects(
-    handler("discord_remove_thread_member")({ thread_id: THREAD, user_id: USER }),
-    /Missing Permissions/,
-  );
+test("other Discord errors on an archived thread surface without unarchiving or retrying", async () => {
+  for (const name of ["discord_add_thread_member", "discord_remove_thread_member"]) {
+    let attempts = 0;
+    const change = async () => {
+      attempts++;
+      throw discordError(10013, "Unknown User", 404);
+    };
+    const calls = stubThread({ archived: true, members: { add: change, remove: change } });
+    await assert.rejects(handler(name)({ thread_id: THREAD, user_id: USER }), /Unknown User/, name);
+    assert.equal(calls.unarchived, 0, name);
+    assert.equal(attempts, 1, name);
+    mock.restoreAll();
+  }
 });
 
 test("create_thread adds member_ids once each and reports the ones Discord refused", async () => {
