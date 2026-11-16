@@ -171,6 +171,31 @@ async function getThreadParent(channelId: string): Promise<TextChannel | NewsCha
   return channel;
 }
 
+/** Inputs shared by the thread member tools. */
+const threadMemberShape = z.object({
+  thread_id: snowflake.describe(
+    "ID (snowflake) of the thread: public, private, announcement, or a forum post.",
+  ),
+  user_id: snowflake.describe("Discord user ID (snowflake) of the member."),
+});
+
+/**
+ * Fetches a thread fresh from Discord, so its archived state is current, and refuses an
+ * archived one: Discord rejects member changes there.
+ */
+async function getOpenThread(threadId: string): Promise<AnyThreadChannel> {
+  const channel = await fetchChannelChecked(validateId(threadId, "thread_id"), { force: true });
+  if (!channel?.isThread())
+    throw new Error(
+      `Channel ${threadId} is not a thread or doesn't exist. Pass a thread ID; discord_list_channel_threads lists a channel's threads.`,
+    );
+  if (channel.archived)
+    throw new Error(
+      `Thread "${channel.name}" (${channel.id}) is archived, and Discord refuses member changes in an archived thread. Unarchive it, for example by sending a message in it, then retry.`,
+    );
+  return channel;
+}
+
 /** Tool definitions for channel and thread messages. */
 const tools = [
   defineTool({
@@ -411,7 +436,7 @@ const tools = [
   defineTool({
     name: "discord_create_thread",
     description:
-      "Create a thread, either branching from an existing message (pass message_id) or as a standalone thread in a text channel (omit message_id). Standalone creation requires a parent text channel and fails if channel_id is itself a thread. Requires the Create Public Threads permission, plus Read Message History when message_id is set. Returns the new thread's ID.",
+      "Create a thread, either branching from an existing message (pass message_id) or as a standalone thread in a text channel (omit message_id). Set private to true for a standalone private thread that only its members and moderators can see, then add people with discord_add_thread_member; Discord branches only public threads from a message, so private refuses message_id. Standalone creation requires a parent text channel and fails if channel_id is itself a thread. Requires the Create Public Threads permission (or Create Private Threads for a private thread), plus Read Message History when message_id is set. Returns the new thread's ID.",
     annotations: {
       title: "Create thread",
       readOnlyHint: false,
@@ -419,24 +444,52 @@ const tools = [
       idempotentHint: false,
       openWorldHint: true,
     },
-    schema: z.object({
-      channel_id: snowflake.describe(
-        "ID (snowflake) of the parent text channel. For a message-based thread, the channel containing message_id.",
+    schema: z
+      .object({
+        channel_id: snowflake.describe(
+          "ID (snowflake) of the parent text channel. For a message-based thread, the channel containing message_id.",
+        ),
+        name: z.string().describe("Name of the thread to create (max 100 characters)."),
+        message_id: snowflake
+          .optional()
+          .describe(
+            "Optional. Message to branch the thread from. If omitted, a standalone thread is created in the channel.",
+          ),
+        auto_archive_duration: z
+          .literal([...AUTO_ARCHIVE_DURATIONS])
+          .default(1440)
+          .describe(
+            "Minutes of inactivity before auto-archiving: 60, 1440, 4320, or 10080. Default 1440 (24h).",
+          ),
+        private: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Optional. True creates a private thread, visible only to its members and to moderators; the bot joins it as its creator. Standalone only: cannot be combined with message_id. Default false (public).",
+          ),
+        invitable: z
+          .boolean()
+          .optional()
+          .describe(
+            "Optional, private threads only. Whether members without Manage Threads can add other people to the thread. Discord's default is true.",
+          ),
+      })
+      .refine(
+        (args) => !(args.private && args.message_id),
+        "private cannot be combined with message_id: Discord branches only public threads from a message. Omit message_id to create a standalone private thread.",
+      )
+      .refine(
+        (args) => args.invitable === undefined || args.private,
+        "invitable applies to private threads only: set private to true or omit invitable.",
       ),
-      name: z.string().describe("Name of the thread to create (max 100 characters)."),
-      message_id: snowflake
-        .optional()
-        .describe(
-          "Optional. Message to branch the thread from. If omitted, a standalone thread is created in the channel.",
-        ),
-      auto_archive_duration: z
-        .literal([...AUTO_ARCHIVE_DURATIONS])
-        .default(1440)
-        .describe(
-          "Minutes of inactivity before auto-archiving: 60, 1440, 4320, or 10080. Default 1440 (24h).",
-        ),
-    }),
-    handle: async ({ channel_id, name, message_id, auto_archive_duration }) => {
+    handle: async ({
+      channel_id,
+      name,
+      message_id,
+      auto_archive_duration,
+      private: isPrivate,
+      invitable,
+    }) => {
       const channel = await getTextChannel(channel_id);
       const duration = auto_archive_duration;
       if (message_id) {
@@ -456,6 +509,22 @@ const tools = [
           `Standalone thread creation requires a parent TextChannel; ${channel_id} is itself a thread. Pass a message_id to start a thread from a message instead.`,
         );
       }
+      if (isPrivate) {
+        const thread = await channel.threads.create({
+          name,
+          autoArchiveDuration: duration,
+          type: ChannelType.PrivateThread,
+          ...(invitable === undefined ? {} : { invitable }),
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ Private thread "${thread.name}" created (id: ${thread.id}). Add people with discord_add_thread_member.`,
+            },
+          ],
+        };
+      }
       const thread = await channel.threads.create({
         name,
         autoArchiveDuration: duration,
@@ -463,6 +532,56 @@ const tools = [
       });
       return {
         content: [{ type: "text", text: `✅ Thread "${thread.name}" created (id: ${thread.id}).` }],
+      };
+    },
+  }),
+  defineTool({
+    name: "discord_add_thread_member",
+    description:
+      "Add a member to a thread. This is how people join a private thread, which they cannot open otherwise; in a public thread it makes them follow it. Works on any thread, forum posts included. Adding someone already in the thread changes nothing. The member must be able to view the parent channel, and the thread must not be archived. Requires the Send Messages in Threads permission. Returns a confirmation. Use discord_remove_thread_member to take someone out, or discord_create_thread with private set to create a private thread.",
+    annotations: {
+      title: "Add thread member",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    schema: threadMemberShape,
+    handle: async ({ thread_id, user_id }) => {
+      const thread = await getOpenThread(thread_id);
+      await thread.members.add(user_id);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ User ${user_id} added to thread "${thread.name}" (${thread.id}).`,
+          },
+        ],
+      };
+    },
+  }),
+  defineTool({
+    name: "discord_remove_thread_member",
+    description:
+      "Remove a member from a thread. In a private thread they lose access until someone adds them again; in a public thread they only stop following it and can still open it. The thread must not be archived. Requires the Manage Threads permission, unless the bot created the private thread. Returns a confirmation. Use discord_add_thread_member to add someone back.",
+    annotations: {
+      title: "Remove thread member",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    schema: threadMemberShape,
+    handle: async ({ thread_id, user_id }) => {
+      const thread = await getOpenThread(thread_id);
+      await thread.members.remove(user_id);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `✅ User ${user_id} removed from thread "${thread.name}" (${thread.id}).`,
+          },
+        ],
       };
     },
   }),
