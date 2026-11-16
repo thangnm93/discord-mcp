@@ -1,11 +1,9 @@
 import { z } from "zod";
 import { discord } from "../client.js";
 import { buildEmbed, embedFieldsShape } from "../embeds.js";
-import { dmRelayStore, relayHeader } from "../dmRelay.js";
-import { dmRelayEnabled } from "../dmRelayStore.js";
-
-/** Discord's limit for the content of one message. */
-const MAX_DM_CONTENT = 2000;
+import { currentCaller } from "../caller.js";
+import { dmRelayLimiter, dmRelayStore, relayHeader } from "../dmRelay.js";
+import { dmRelayCallerHeader, dmRelayEnabled } from "../dmRelayStore.js";
 import {
   defineTool,
   defineModule,
@@ -16,7 +14,47 @@ import {
   messageAuthorShape,
 } from "./define.js";
 
+/** Discord's limit for the content of one message. */
+const MAX_DM_CONTENT = 2000;
+
 const userId = snowflake.describe("Discord user ID (snowflake) of the DM recipient.");
+
+/**
+ * Checks that the caller may send a DM for `relayTo`. With DISCORD_DM_RELAY_CALLER_HEADER
+ * set, the gateway's header names the caller and relay_to must be that person; without
+ * it, relay_to is taken on trust. Either way, one sender gets a bounded number per window.
+ */
+function authorizeRelay(relayTo: string): void {
+  if (!dmRelayEnabled())
+    throw new Error(
+      "relay_to needs the DM relay, which is off on this server. Start it with DISCORD_DM_RELAY=true, or send without relay_to.",
+    );
+  const header = dmRelayCallerHeader();
+  if (header) {
+    const caller = currentCaller().discordUserId;
+    if (!caller)
+      throw new Error(
+        `relay_to needs to know who is calling, and this request has no valid ${header} header. Call through the gateway that sets it.`,
+      );
+    if (caller !== relayTo)
+      throw new Error(
+        `relay_to must be your own Discord user ID (${caller}): a DM cannot be sent on behalf of someone else.`,
+      );
+  }
+  const slot = dmRelayLimiter().take(relayTo);
+  if (!slot.ok)
+    throw new Error(
+      `Too many relayed DMs from user ${relayTo}: wait ${Math.ceil(slot.retryInMs / 1000)}s, or send without relay_to.`,
+    );
+}
+
+/**
+ * Whether the caller may see relayed messages in this DM. Only the person the DM is with
+ * may, and only when a gateway header proves who is calling.
+ */
+function canReadRelayed(dmUserId: string): boolean {
+  return Boolean(dmRelayCallerHeader()) && currentCaller().discordUserId === dmUserId;
+}
 const messageId = snowflake.describe("ID of the target message within the DM conversation.");
 
 /** Tool definitions for direct messages. */
@@ -24,7 +62,7 @@ const tools = [
   defineTool({
     name: "discord_send_dm",
     description:
-      "Send a private direct message to a user by their user ID. Use discord_send_message to post in a server channel instead. Set relay_to to send on behalf of a person: the DM opens with their name, and the recipient's answers reach them as DMs from the bot, in both directions, when the server runs with DISCORD_DM_RELAY=true. Requires the bot to share at least one server with the user, and the user must allow DMs from server members (otherwise Discord rejects the send). Returns the new message ID.",
+      "Send a private direct message to a user by their user ID. Use discord_send_message to post in a server channel instead. Set relay_to to send on behalf of a person: the DM opens with their name, and the recipient's answers reach them as DMs from the bot, in both directions, when the server runs with DISCORD_DM_RELAY=true. Behind a gateway that names callers, relay_to must be the caller's own ID; each sender may start a limited number of relayed DMs per 10 minutes. Requires the bot to share at least one server with the user, and the user must allow DMs from server members (otherwise Discord rejects the send). Returns the new message ID.",
     annotations: {
       title: "Send DM",
       readOnlyHint: false,
@@ -39,7 +77,7 @@ const tools = [
         relay_to: snowflake
           .optional()
           .describe(
-            "Optional. Discord user ID (snowflake) of the person the DM is sent for. Their name heads the DM, which leaves less room for content, and the recipient's answers are relayed to them. Needs DISCORD_DM_RELAY=true on the server.",
+            "Optional. Discord user ID (snowflake) of the person the DM is sent for, normally the caller. Their name heads the DM, which leaves less room for content, and the recipient's answers are relayed to them. Needs DISCORD_DM_RELAY=true on the server.",
           ),
       })
       .refine(
@@ -47,21 +85,30 @@ const tools = [
         "relay_to must differ from user_id: the recipient's answers would come back to them.",
       ),
     handle: async ({ user_id, content, relay_to }) => {
-      if (relay_to && !dmRelayEnabled())
-        throw new Error(
-          "relay_to needs the DM relay, which is off on this server. Start it with DISCORD_DM_RELAY=true, or send without relay_to.",
-        );
       const text = relay_to ? `${relayHeader(relay_to)}\n${content}` : content;
       if (relay_to && text.length > MAX_DM_CONTENT)
         throw new Error(
           `The DM is ${text.length} characters with the relay header; Discord accepts ${MAX_DM_CONTENT}. Shorten content by ${text.length - MAX_DM_CONTENT}.`,
         );
+      if (relay_to) {
+        authorizeRelay(relay_to);
+        // Before sending: a DM whose link cannot be saved would get answers nobody receives.
+        await dmRelayStore().ready();
+      }
       const user = await discord.users.fetch(user_id);
       const sent = await user.send(
         relay_to ? { content: text, allowedMentions: { parse: [] } } : content,
       );
-      if (relay_to) await dmRelayStore().record([sent.id], user_id, relay_to);
-      const relayNote = relay_to ? ` Answers will be relayed to user ${relay_to}.` : "";
+      let relayNote = "";
+      if (relay_to) {
+        // The DM is out: a failure from here on is reported, never thrown, or a retry would send it twice.
+        try {
+          await dmRelayStore().record([sent.id], user_id, relay_to);
+          relayNote = ` Answers will be relayed to user ${relay_to}.`;
+        } catch (err) {
+          relayNote = ` ⚠️ The relay link could not be saved (${(err as Error).message}), so answers to this DM will not be relayed. Do not resend it.`;
+        }
+      }
       return {
         content: [
           {
@@ -204,7 +251,7 @@ const tools = [
   defineTool({
     name: "discord_read_dms",
     description:
-      "Read the most recent messages from the bot's DM conversation with a user, oldest-to-newest. Returns { messages: [...] } with id, author, content, embed count, timestamp. Read-only.",
+      "Read the most recent messages from the bot's DM conversation with a user, oldest-to-newest. Returns { messages: [...] } with id, author, content, embed count, timestamp. With the DM relay on, messages relayed between people are left out and counted in hidden_relayed, unless a gateway header shows the caller is that user. Read-only.",
     annotations: { title: "Read DMs", readOnlyHint: true, openWorldHint: true },
     schema: z.object({
       user_id: userId,
@@ -223,12 +270,20 @@ const tools = [
           timestamp: z.string(),
         }),
       ),
+      hidden_relayed: z.number().optional(),
     }),
     handle: async ({ user_id, limit }) => {
       const user = await discord.users.fetch(user_id);
       const dm = await user.createDM();
       const messages = await dm.messages.fetch({ limit, cache: false });
-      const result = [...messages.values()]
+      let visible = [...messages.values()];
+      let hidden = 0;
+      if (dmRelayEnabled() && !canReadRelayed(user_id)) {
+        const relayed = await Promise.all(visible.map((m) => dmRelayStore().isRelayed(m.id)));
+        hidden = relayed.filter(Boolean).length;
+        visible = visible.filter((_, i) => !relayed[i]);
+      }
+      const result = visible
         .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
         .map((m) => ({
           id: m.id,
@@ -238,7 +293,7 @@ const tools = [
           embeds: m.embeds.length,
           timestamp: m.createdAt.toISOString(),
         }));
-      return structured({ messages: result });
+      return structured({ messages: result, ...(hidden ? { hidden_relayed: hidden } : {}) });
     },
   }),
   defineTool({

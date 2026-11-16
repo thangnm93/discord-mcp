@@ -7,12 +7,15 @@ import { dirname, join } from "path";
  * so `client.ts` can read the config at import time and the routing rules are testable.
  */
 
-/** Plain messages without a Reply go to the only person who relayed to the author within this window. */
+/** Plain messages without a Reply are routed only within this window. */
 export const RELAY_WINDOW_MS = 24 * 60 * 60 * 1000;
 /** A Reply still finds its sender this long after the relayed message. */
 export const RELAY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
-/** Oldest links go first past this many, so the store file stays small. */
+/** Oldest entries go first past this many, so the store file stays small. */
 export const RELAY_MAX_LINKS = 20_000;
+/** Relayed DMs one sender may start within RELAY_RATE_WINDOW_MS. */
+export const RELAY_RATE_MAX = 20;
+export const RELAY_RATE_WINDOW_MS = 10 * 60 * 1000;
 
 const ON = ["true", "1", "yes", "on"];
 const OFF = ["false", "0", "no", "off"];
@@ -37,6 +40,20 @@ export function dmRelayStorePath(): string {
   return raw ? raw : join(homedir(), ".discord-mcp", "dm-relay.json");
 }
 
+/**
+ * The HTTP header, lowercased, in which a trusted gateway names the caller's Discord user
+ * ID (`DISCORD_DM_RELAY_CALLER_HEADER`). Unset means the server does not know its callers.
+ */
+export function dmRelayCallerHeader(): string | undefined {
+  const raw = process.env.DISCORD_DM_RELAY_CALLER_HEADER?.trim().toLowerCase();
+  if (!raw) return undefined;
+  if (!/^[a-z0-9-]+$/.test(raw))
+    throw new Error(
+      `Invalid DISCORD_DM_RELAY_CALLER_HEADER: "${raw}". Use a header name such as x-discord-user-id.`,
+    );
+  return raw;
+}
+
 /** A bot message in `owner`'s DM whose replies go to `peer`. */
 export interface RelayLink {
   owner: string;
@@ -54,13 +71,15 @@ export interface RelayState {
   version: 1;
   links: Record<string, RelayLink>;
   contacts: Record<string, RelayContact[]>;
+  /** Messages people wrote that the relay forwarded, kept to hide them from DM reads. */
+  sources: Record<string, number>;
 }
 
 export type RelayRoute =
   { kind: "peer"; peer: string } | { kind: "ambiguous"; peers: string[] } | { kind: "none" };
 
 export function emptyRelayState(): RelayState {
-  return { version: 1, links: {}, contacts: {} };
+  return { version: 1, links: {}, contacts: {}, sources: {} };
 }
 
 /**
@@ -81,15 +100,19 @@ export function recordRelay(
 }
 
 /**
- * Finds who a DM from `author` is for. A Reply goes to the sender of the relayed message
- * it answers, and a Reply to any other message belongs to no relay: guessing would leak
- * an answer meant for someone else. A plain message goes to the only person who relayed
- * to `author` within the window; several candidates make it ambiguous.
+ * Finds who a DM from `author` is for.
+ * - A Reply goes to the sender of the relayed message it answers. A Reply to any other
+ *   message belongs to no relay: guessing would leak an answer meant for someone else.
+ * - A plain message is routed only when the bot's latest message in that DM is a relayed
+ *   one from the last 24 hours, so an answer to some other bot DM (a notification, a
+ *   report) never travels. It goes to that sender, unless several people relayed to the
+ *   author within the window: then it is ambiguous.
  */
 export function resolveRelay(
   state: RelayState,
   author: string,
   replyToId: string | undefined,
+  lastBotMessageId: string | undefined,
   now: number,
 ): RelayRoute {
   if (replyToId) {
@@ -98,20 +121,28 @@ export function resolveRelay(
       ? { kind: "peer", peer: link.peer }
       : { kind: "none" };
   }
+  const last = lastBotMessageId ? state.links[lastBotMessageId] : undefined;
+  if (!last || last.owner !== author || now - last.at > RELAY_WINDOW_MS) return { kind: "none" };
   const recent = (state.contacts[author] ?? []).filter((c) => now - c.at <= RELAY_WINDOW_MS);
-  if (recent.length === 1) return { kind: "peer", peer: recent[0].peer };
   if (recent.length > 1)
     return { kind: "ambiguous", peers: recent.sort((a, b) => b.at - a.at).map((c) => c.peer) };
-  return { kind: "none" };
+  return { kind: "peer", peer: last.peer };
 }
 
-/** Drops links past retention, then the oldest links past the cap, and contacts past the window. */
+/** Keeps the newest `max` entries of a record whose values carry a timestamp. */
+function newest<T>(entries: [string, T][], at: (value: T) => number, now: number, max: number) {
+  return Object.fromEntries(
+    entries
+      .filter(([, value]) => now - at(value) <= RELAY_RETENTION_MS)
+      .sort(([, a], [, b]) => at(b) - at(a))
+      .slice(0, max),
+  );
+}
+
+/** Drops entries past retention, then the oldest past the cap, and contacts past the window. */
 export function pruneRelay(state: RelayState, now: number): void {
-  const kept = Object.entries(state.links)
-    .filter(([, link]) => now - link.at <= RELAY_RETENTION_MS)
-    .sort(([, a], [, b]) => b.at - a.at)
-    .slice(0, RELAY_MAX_LINKS);
-  state.links = Object.fromEntries(kept);
+  state.links = newest(Object.entries(state.links), (l) => l.at, now, RELAY_MAX_LINKS);
+  state.sources = newest(Object.entries(state.sources), (at) => at, now, RELAY_MAX_LINKS);
   for (const [owner, contacts] of Object.entries(state.contacts)) {
     const recent = contacts.filter((c) => now - c.at <= RELAY_WINDOW_MS);
     if (recent.length) state.contacts[owner] = recent;
@@ -131,7 +162,12 @@ export async function loadRelayState(path: string): Promise<RelayState> {
   const parsed = JSON.parse(text) as Partial<RelayState>;
   if (parsed.version !== 1 || typeof parsed.links !== "object" || !parsed.links)
     throw new Error(`${path} is not a DM relay store (version 1).`);
-  return { version: 1, links: parsed.links, contacts: parsed.contacts ?? {} };
+  return {
+    version: 1,
+    links: parsed.links,
+    contacts: parsed.contacts ?? {},
+    sources: parsed.sources ?? {},
+  };
 }
 
 /** Writes the state through a temporary file, so a crash mid-write leaves the old file whole. */
@@ -143,8 +179,9 @@ export async function saveRelayState(path: string, state: RelayState): Promise<v
 }
 
 /**
- * The relay state behind one file. Loads on first use; every change is pruned and saved
- * before it resolves, one save at a time.
+ * The relay state behind one file. Loads on first use, and loads again after a failed
+ * load instead of failing until restart. Every change is pruned and saved before it
+ * resolves, one save at a time.
  */
 export class RelayStore {
   private state: RelayState | null = null;
@@ -158,8 +195,25 @@ export class RelayStore {
 
   private async current(): Promise<RelayState> {
     if (this.state) return this.state;
-    this.loading ??= loadRelayState(this.path).then((state) => (this.state = state));
+    this.loading ??= loadRelayState(this.path).then(
+      (state) => (this.state = state),
+      (err) => {
+        this.loading = null;
+        throw err;
+      },
+    );
     return this.loading;
+  }
+
+  private async save(state: RelayState): Promise<void> {
+    const save = this.queue.then(() => saveRelayState(this.path, state));
+    this.queue = save.catch(() => {});
+    await save;
+  }
+
+  /** Loads the file and writes it back, proving both work before a DM depends on them. */
+  async ready(): Promise<void> {
+    await this.save(await this.current());
   }
 
   async record(messageIds: string[], owner: string, peer: string): Promise<void> {
@@ -167,12 +221,51 @@ export class RelayStore {
     const now = this.now();
     recordRelay(state, messageIds, owner, peer, now);
     pruneRelay(state, now);
-    const save = this.queue.then(() => saveRelayState(this.path, state));
-    this.queue = save.catch(() => {});
-    await save;
+    await this.save(state);
   }
 
-  async resolve(author: string, replyToId: string | undefined): Promise<RelayRoute> {
-    return resolveRelay(await this.current(), author, replyToId, this.now());
+  /** Marks a message someone wrote as forwarded by the relay. */
+  async recordSource(messageId: string): Promise<void> {
+    const state = await this.current();
+    state.sources[messageId] = this.now();
+    await this.save(state);
+  }
+
+  async resolve(
+    author: string,
+    replyToId: string | undefined,
+    lastBotMessageId?: string,
+  ): Promise<RelayRoute> {
+    return resolveRelay(await this.current(), author, replyToId, lastBotMessageId, this.now());
+  }
+
+  /** Whether a DM message is part of a relayed conversation: sent for someone, or forwarded. */
+  async isRelayed(messageId: string): Promise<boolean> {
+    const state = await this.current();
+    return messageId in state.links || messageId in state.sources;
+  }
+}
+
+/** Counts relayed DMs per sender over a sliding window, in memory. */
+export class RelayRateLimiter {
+  private readonly sent = new Map<string, number[]>();
+
+  constructor(
+    private readonly max = RELAY_RATE_MAX,
+    private readonly windowMs = RELAY_RATE_WINDOW_MS,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /** Takes one slot for `sender`, or returns the milliseconds until one frees up. */
+  take(sender: string): { ok: true } | { ok: false; retryInMs: number } {
+    const now = this.now();
+    const recent = (this.sent.get(sender) ?? []).filter((at) => now - at < this.windowMs);
+    if (recent.length >= this.max) {
+      this.sent.set(sender, recent);
+      return { ok: false, retryInMs: this.windowMs - (now - recent[0]) };
+    }
+    recent.push(now);
+    this.sent.set(sender, recent);
+    return { ok: true };
   }
 }

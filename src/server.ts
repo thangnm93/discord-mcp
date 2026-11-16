@@ -6,6 +6,7 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 
+import { callerFromHeaders, runAsCaller } from "./caller.js";
 import { ensureConnected } from "./client.js";
 import { formatToolError } from "./errors.js";
 import { getAllDefinitions, handleTool, hasTool } from "./tools/index.js";
@@ -38,13 +39,14 @@ export function createServer(version: string): Server {
     return { tools: getAllDefinitions() };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const { name, arguments: args = {} } = req.params;
     if (!hasTool(name)) throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
 
     try {
       await ensureConnected();
-      return await handleTool(name, args);
+      const caller = callerFromHeaders(extra.requestInfo?.headers);
+      return await runAsCaller(caller, () => handleTool(name, args));
     } catch (err: unknown) {
       return {
         content: [{ type: "text", text: `❌ Error: ${formatToolError(err)}` }],

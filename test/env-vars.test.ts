@@ -85,6 +85,7 @@ const HTTP_ONLY = new Set([
   // The DM relay needs a process that keeps running, which a desktop bundle is not.
   "DISCORD_DM_RELAY",
   "DISCORD_DM_RELAY_STORE",
+  "DISCORD_DM_RELAY_CALLER_HEADER",
 ]);
 
 test("manifest.json maps every env var src/ reads except the HTTP-only ones, and only those", () => {

@@ -1,6 +1,6 @@
 import { Events, type Message, type MessageCreateOptions } from "discord.js";
 import { discord, ensureConnected } from "./client.js";
-import { RelayStore, dmRelayStorePath, type RelayRoute } from "./dmRelayStore.js";
+import { RelayRateLimiter, RelayStore, dmRelayStorePath, type RelayRoute } from "./dmRelayStore.js";
 
 /**
  * DM relay: a DM sent with `relay_to` names its sender, and the recipient's answers come
@@ -12,13 +12,26 @@ import { RelayStore, dmRelayStorePath, type RelayRoute } from "./dmRelayStore.js
 const MAX_CONTENT = 2000;
 /** How long to wait before retrying a failed connection while the relay runs. */
 const RECONNECT_DELAY_MS = 60_000;
+/** How far back a plain message looks for the bot's latest message in the DM. */
+const HISTORY_LOOKBACK = 20;
+
+/** Bot messages that are the relay talking to a person, not something they could answer. */
+const AMBIGUOUS_PREFIX = "🔁 ";
+const FAILURE_PREFIX = "⚠️ ";
 
 let store: RelayStore | null = null;
+let limiter: RelayRateLimiter | null = null;
 
 /** The process-wide store, created on first use from DISCORD_DM_RELAY_STORE. */
 export function dmRelayStore(): RelayStore {
   store ??= new RelayStore(dmRelayStorePath());
   return store;
+}
+
+/** The process-wide rate limit on relayed DMs per sender. */
+export function dmRelayLimiter(): RelayRateLimiter {
+  limiter ??= new RelayRateLimiter();
+  return limiter;
 }
 
 /** The first line of a DM sent on someone's behalf. */
@@ -29,6 +42,11 @@ export function relayHeader(sender: string): string {
 /** The first line of a forwarded answer. */
 export function forwardHeader(author: string): string {
   return `📩 <@${author}> answered. Reply to this message to answer them.`;
+}
+
+/** Whether a bot message is one of the relay's own notices, which nobody answers. */
+export function isRelayNotice(content: string): boolean {
+  return content.startsWith(AMBIGUOUS_PREFIX) || content.startsWith(FAILURE_PREFIX);
 }
 
 /** Splits text into chunks Discord accepts, preferring line breaks. */
@@ -47,12 +65,17 @@ export function splitContent(text: string, max = MAX_CONTENT): string[] {
 
 /** What a relay handler needs from Discord, so tests can stand in for it. */
 export interface RelayDeps {
-  store: Pick<RelayStore, "record" | "resolve">;
+  store: Pick<RelayStore, "record" | "recordSource" | "resolve">;
   /** Sends one message to a user's DM and returns its id. */
   sendDm(userId: string, options: MessageCreateOptions): Promise<string>;
+  /** The id of the bot's latest message before `message` in its DM, skipping relay notices. */
+  lastBotMessageId(message: IncomingDm): Promise<string | undefined>;
 }
 
-type IncomingDm = Pick<Message, "author" | "content" | "attachments" | "reference"> & {
+export type IncomingDm = Pick<
+  Message,
+  "id" | "author" | "content" | "attachments" | "reference"
+> & {
   inGuild(): boolean;
   reply(content: string): Promise<unknown>;
   react(emoji: string): Promise<unknown>;
@@ -60,6 +83,15 @@ type IncomingDm = Pick<Message, "author" | "content" | "attachments" | "referenc
 
 /** Mentions in relayed text render as names but never ping anyone. */
 const NO_PINGS = { parse: [] } as MessageCreateOptions["allowedMentions"];
+
+/** Runs a store write whose failure must not stop the relay, logging it instead. */
+async function bestEffort(what: string, write: () => Promise<void>): Promise<void> {
+  try {
+    await write();
+  } catch (err) {
+    console.error(`DM relay could not ${what}: ${(err as Error).message}`);
+  }
+}
 
 /**
  * Forwards a DM sent to the bot to the person it answers. Ignores bots, server messages
@@ -69,11 +101,13 @@ const NO_PINGS = { parse: [] } as MessageCreateOptions["allowedMentions"];
 export async function handleRelayDm(message: IncomingDm, deps: RelayDeps): Promise<void> {
   if (message.author.bot || message.inGuild()) return;
   const author = message.author.id;
-  const route: RelayRoute = await deps.store.resolve(author, message.reference?.messageId);
+  const replyTo = message.reference?.messageId;
+  const lastBot = replyTo ? undefined : await deps.lastBotMessageId(message);
+  const route: RelayRoute = await deps.store.resolve(author, replyTo, lastBot);
   if (route.kind === "none") return;
   if (route.kind === "ambiguous") {
     await message.reply(
-      `Several people wrote to you through me recently: ${route.peers.map((p) => `<@${p}>`).join(", ")}. Use Reply on the message you are answering, so I know who it is for.`,
+      `${AMBIGUOUS_PREFIX}Several people wrote to you through me recently: ${route.peers.map((p) => `<@${p}>`).join(", ")}. Use Reply on the message you are answering, so I know who it is for.`,
     );
     return;
   }
@@ -86,35 +120,43 @@ export async function handleRelayDm(message: IncomingDm, deps: RelayDeps): Promi
   try {
     for (const [i, content] of chunks.entries()) {
       const last = i === chunks.length - 1;
-      sent.push(await sendChunk(deps, route.peer, content, last ? files : []));
+      sent.push(...(await sendChunk(deps, route.peer, content, last ? files : [])));
     }
   } catch (err) {
-    if (sent.length) await deps.store.record(sent, route.peer, author);
+    if (sent.length)
+      await bestEffort("save a partial delivery", () =>
+        deps.store.record(sent, route.peer, author),
+      );
     await message.reply(
-      `⚠️ I could not deliver this to <@${route.peer}>: ${(err as Error).message}`,
+      `${FAILURE_PREFIX}I could not deliver this to <@${route.peer}>: ${(err as Error).message}`,
     );
     return;
   }
-  await deps.store.record(sent, route.peer, author);
+  // Delivered: a store failure from here on must not hide that from the author.
+  await bestEffort("save a delivery", () => deps.store.record(sent, route.peer, author));
+  await bestEffort("mark a forwarded message", () => deps.store.recordSource(message.id));
   await message.react("✅").catch(() => {});
 }
 
-/** Sends a chunk with its files; when Discord refuses the upload, sends their links instead. */
+/**
+ * Sends a chunk with its files. When Discord refuses the upload, sends their links
+ * instead, over as many messages as they need. Returns the ids of the messages sent.
+ */
 async function sendChunk(
   deps: RelayDeps,
   userId: string,
   content: string,
   files: { attachment: string; name: string }[],
-): Promise<string> {
-  if (!files.length) return deps.sendDm(userId, { content, allowedMentions: NO_PINGS });
+): Promise<string[]> {
+  if (!files.length) return [await deps.sendDm(userId, { content, allowedMentions: NO_PINGS })];
   try {
-    return await deps.sendDm(userId, { content, files, allowedMentions: NO_PINGS });
+    return [await deps.sendDm(userId, { content, files, allowedMentions: NO_PINGS })];
   } catch {
     const links = files.map((f) => f.attachment).join("\n");
-    return deps.sendDm(userId, {
-      content: splitContent(`${content}\n${links}`)[0],
-      allowedMentions: NO_PINGS,
-    });
+    const ids: string[] = [];
+    for (const part of splitContent(`${content}\n${links}`))
+      ids.push(await deps.sendDm(userId, { content: part, allowedMentions: NO_PINGS }));
+    return ids;
   }
 }
 
@@ -124,30 +166,53 @@ async function sendDm(userId: string, options: MessageCreateOptions): Promise<st
   return (await user.send(options)).id;
 }
 
+/** Reads the DM history just before `message` through the live client. */
+async function lastBotMessageId(message: IncomingDm): Promise<string | undefined> {
+  const live = message as unknown as Message;
+  const history = await live.channel.messages.fetch({
+    before: message.id,
+    limit: HISTORY_LOOKBACK,
+    cache: false,
+  });
+  const botId = discord.user?.id;
+  return [...history.values()]
+    .sort((a, b) => b.createdTimestamp - a.createdTimestamp)
+    .find((m) => m.author.id === botId && !isRelayNotice(m.content))?.id;
+}
+
 let started = false;
 
 /**
  * Starts listening for DMs and keeps the bot connected: the relay must hear answers even
- * when no tool runs. Call once at startup, only with DISCORD_DM_RELAY on.
+ * when no tool runs. Checks the store first, so a store that cannot be written shows up
+ * at startup. Call once, only with DISCORD_DM_RELAY on.
  */
 export function startDmRelay(): void {
   if (started) return;
   started = true;
-  const deps: RelayDeps = { store: dmRelayStore(), sendDm };
+  const relayStore = dmRelayStore();
+  relayStore.ready().then(
+    () => console.error(`DM relay store ready: ${relayStore.path}`),
+    (err) =>
+      console.error(
+        `DM relay store ${relayStore.path} is not usable, relayed DMs will be refused until it is: ${(err as Error).message}`,
+      ),
+  );
+  const deps: RelayDeps = { store: relayStore, sendDm, lastBotMessageId };
   discord.on(Events.MessageCreate, (message) => {
     handleRelayDm(message, deps).catch((err) =>
       console.error("DM relay error:", (err as Error).message),
     );
   });
-  discord.on(Events.Invalidated, () => setTimeout(connect, RECONNECT_DELAY_MS).unref());
   const connect = () => {
     ensureConnected().then(
-      () => console.error(`DM relay listening, store: ${dmRelayStore().path}`),
+      () => console.error("DM relay listening for DMs."),
       (err) => {
         console.error(`DM relay could not connect, retrying in 60s: ${(err as Error).message}`);
         setTimeout(connect, RECONNECT_DELAY_MS).unref();
       },
     );
   };
+  discord.on(Events.Invalidated, () => setTimeout(connect, RECONNECT_DELAY_MS).unref());
   connect();
 }

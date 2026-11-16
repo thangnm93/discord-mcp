@@ -4,11 +4,15 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ZodError } from "zod";
+import { callerFromHeaders, runAsCaller } from "../src/caller.js";
 import { discord } from "../src/client.js";
+import { dmRelayLimiter, dmRelayStore } from "../src/dmRelay.js";
+import { RELAY_RATE_MAX } from "../src/dmRelayStore.js";
 import dm from "../src/tools/dm.js";
 
 const SENDER = "111111111111111111";
 const RECIPIENT = "222222222222222222";
+const SENT_ID = "999999999999999999";
 
 const dir = mkdtempSync(join(tmpdir(), "dm-relay-tool-"));
 const storePath = join(dir, "relay.json");
@@ -18,14 +22,31 @@ process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
 afterEach(() => {
   mock.restoreAll();
   delete process.env.DISCORD_DM_RELAY;
+  delete process.env.DISCORD_DM_RELAY_CALLER_HEADER;
 });
 
 const sendDm = () => dm.handlers.get("discord_send_dm")!;
+const readDms = () => dm.handlers.get("discord_read_dms")!;
 const textOf = (result: { content: { text?: string }[] }) =>
   result.content.map((c) => c.text ?? "").join("\n");
 
-function stubUser() {
+let nextId = 100;
+function stubUser(history: { id: string; content: string }[] = []) {
   const sent: unknown[] = [];
+  const messages = new Map(
+    history.map((m, i) => [
+      m.id,
+      {
+        id: m.id,
+        content: m.content,
+        createdTimestamp: i,
+        createdAt: new Date(i),
+        author: { id: SENDER, username: "someone" },
+        webhookId: null,
+        embeds: [],
+      },
+    ]),
+  );
   mock.method(
     discord.users,
     "fetch",
@@ -34,8 +55,9 @@ function stubUser() {
         username: "recipient",
         send: async (payload: unknown) => {
           sent.push(payload);
-          return { id: "999999999999999999" };
+          return { id: sent.length === 1 ? SENT_ID : String(nextId++) };
         },
+        createDM: async () => ({ messages: { fetch: async () => messages } }),
       }) as never,
   );
   return sent;
@@ -87,11 +109,8 @@ test("with the relay on, the DM names its sender and the link is saved", async (
   assert.deepEqual(payload.allowedMentions, { parse: [] });
   assert.match(textOf(result), new RegExp(`relayed to user ${SENDER}`));
   const saved = JSON.parse(readFileSync(storePath, "utf8"));
-  assert.deepEqual(saved.links["999999999999999999"], {
-    owner: RECIPIENT,
-    peer: SENDER,
-    at: saved.links["999999999999999999"].at,
-  });
+  assert.equal(saved.links[SENT_ID].owner, RECIPIENT);
+  assert.equal(saved.links[SENT_ID].peer, SENDER);
 });
 
 test("content that no longer fits with the relay header is refused with the overflow", async () => {
@@ -102,4 +121,93 @@ test("content that no longer fits with the relay header is refused with the over
     /Shorten content by \d+/,
   );
   assert.equal(sent.length, 0);
+});
+
+test("a store that cannot be written refuses relay_to before the DM goes out", async () => {
+  process.env.DISCORD_DM_RELAY = "true";
+  const sent = stubUser();
+  mock.method(dmRelayStore(), "ready", async () => {
+    throw new Error("EROFS: read-only file system");
+  });
+  await assert.rejects(sendDm()({ user_id: RECIPIENT, content: "hi", relay_to: SENDER }), /EROFS/);
+  assert.equal(sent.length, 0);
+});
+
+test("a link that fails to save after sending is reported, not thrown, so nobody resends", async () => {
+  process.env.DISCORD_DM_RELAY = "true";
+  const sent = stubUser();
+  mock.method(dmRelayStore(), "record", async () => {
+    throw new Error("disk full");
+  });
+  const result = await sendDm()({ user_id: RECIPIENT, content: "hi", relay_to: SENDER });
+  assert.equal(sent.length, 1);
+  assert.match(textOf(result), /^✅ DM sent/);
+  assert.match(textOf(result), /could not be saved \(disk full\).*Do not resend/);
+});
+
+test("relayed DMs per sender are rate limited", async () => {
+  process.env.DISCORD_DM_RELAY = "true";
+  stubUser();
+  const limiter = dmRelayLimiter();
+  const other = "333333333333333333";
+  for (let i = 0; i < RELAY_RATE_MAX; i++) assert.equal(limiter.take(other).ok, true);
+  await assert.rejects(
+    sendDm()({ user_id: RECIPIENT, content: "hi", relay_to: other }),
+    /Too many relayed DMs from user 333333333333333333: wait \d+s/,
+  );
+});
+
+test("behind a gateway header, relay_to must be the caller", async () => {
+  process.env.DISCORD_DM_RELAY = "true";
+  process.env.DISCORD_DM_RELAY_CALLER_HEADER = "X-Discord-User-Id";
+  const sent = stubUser();
+  const call = (relay_to: string) => () =>
+    sendDm()({ user_id: RECIPIENT, content: "hi", relay_to });
+
+  await assert.rejects(call(SENDER)(), /no valid x-discord-user-id header/);
+  const caller = callerFromHeaders({ "x-discord-user-id": "444444444444444444" });
+  await assert.rejects(runAsCaller(caller, call(SENDER)), /must be your own Discord user ID/);
+  assert.equal(sent.length, 0);
+
+  const self = callerFromHeaders({ "x-discord-user-id": SENDER });
+  const result = await runAsCaller(self, call(SENDER));
+  assert.match(textOf(result), /relayed to user/);
+});
+
+test("callerFromHeaders ignores a malformed or missing header", () => {
+  process.env.DISCORD_DM_RELAY_CALLER_HEADER = "x-discord-user-id";
+  assert.deepEqual(callerFromHeaders({ "x-discord-user-id": "abc" }), {});
+  assert.deepEqual(callerFromHeaders({}), {});
+  assert.deepEqual(callerFromHeaders({ "x-discord-user-id": [SENDER, "x"] }), {
+    discordUserId: SENDER,
+  });
+  delete process.env.DISCORD_DM_RELAY_CALLER_HEADER;
+  assert.deepEqual(callerFromHeaders({ "x-discord-user-id": SENDER }), {}, "no header configured");
+});
+
+test("read_dms hides relayed messages unless a gateway header shows the caller is that user", async () => {
+  process.env.DISCORD_DM_RELAY = "true";
+  await dmRelayStore().record(["700000000000000001"], RECIPIENT, SENDER);
+  await dmRelayStore().recordSource("700000000000000002");
+  stubUser([
+    { id: "700000000000000000", content: "a notification" },
+    { id: "700000000000000001", content: "📨 From someone" },
+    { id: "700000000000000002", content: "their answer" },
+  ]);
+  const hidden = (await readDms()({ user_id: RECIPIENT })).structuredContent as {
+    messages: { id: string }[];
+    hidden_relayed?: number;
+  };
+  assert.deepEqual(
+    hidden.messages.map((m) => m.id),
+    ["700000000000000000"],
+  );
+  assert.equal(hidden.hidden_relayed, 2);
+
+  process.env.DISCORD_DM_RELAY_CALLER_HEADER = "x-discord-user-id";
+  const owner = callerFromHeaders({ "x-discord-user-id": RECIPIENT });
+  const shown = (await runAsCaller(owner, () => readDms()({ user_id: RECIPIENT })))
+    .structuredContent as { messages: unknown[]; hidden_relayed?: number };
+  assert.equal(shown.messages.length, 3);
+  assert.equal(shown.hidden_relayed, undefined);
 });
