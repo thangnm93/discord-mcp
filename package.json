@@ -1,8 +1,7 @@
 {
-  "name": "@pasympa/discord-mcp",
-  "version": "2.4.0",
-  "mcpName": "io.github.PaSympa/discord-mcp",
-  "description": "Discord MCP server for Claude, Codex, Cursor and VS Code: read and send messages, moderate members, manage roles, channels, forums, webhooks and events. Toolset profiles, guild allow-list, dry-run for mass actions.",
+  "name": "@thangnm93/discord-mcp",
+  "version": "2.5.0",
+  "description": "Fork of @pasympa/discord-mcp 2.4.0 that adds private threads and thread member tools. Discord MCP server for Claude, Codex, Cursor and VS Code.",
   "main": "dist/index.js",
   "type": "commonjs",
   "bin": {
@@ -50,11 +49,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/PaSympa/discord-mcp"
+    "url": "https://github.com/thangnm93/discord-mcp"
   },
-  "homepage": "https://github.com/PaSympa/discord-mcp#readme",
+  "homepage": "https://github.com/thangnm93/discord-mcp#readme",
   "bugs": {
-    "url": "https://github.com/PaSympa/discord-mcp/issues"
+    "url": "https://github.com/thangnm93/discord-mcp/issues"
   },
   "engines": {
     "node": ">=22.0.0"

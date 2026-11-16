@@ -17,6 +17,8 @@
 
 </div>
 
+> **Fork.** `@thangnm93/discord-mcp` is [PaSympa/discord-mcp](https://github.com/PaSympa/discord-mcp) 2.4.0 plus private threads and thread member tools, proposed upstream in [PR #200](https://github.com/PaSympa/discord-mcp/pull/200): `discord_create_thread` takes `private` and `invitable`, and `discord_add_thread_member` / `discord_remove_thread_member` are new. Use `npx -y @thangnm93/discord-mcp` wherever the commands below say `@pasympa/discord-mcp`. Everything else is upstream.
+
 **discord-mcp** connects Claude, Codex, Cursor, VS Code and any other MCP client to your Discord server through your own bot. Ask in plain language: your assistant reads channels, answers, moderates, and manages roles, channels, forums and events, with 102 tools behind it.
 
 ## See it in action
