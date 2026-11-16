@@ -1,4 +1,4 @@
-import { Events, type Message, type MessageCreateOptions } from "discord.js";
+import { DiscordAPIError, Events, type Message, type MessageCreateOptions } from "discord.js";
 import { discord, ensureConnected } from "./client.js";
 import { RelayRateLimiter, RelayStore, dmRelayStorePath, type RelayRoute } from "./dmRelayStore.js";
 
@@ -118,10 +118,12 @@ export async function handleRelayDm(message: IncomingDm, deps: RelayDeps): Promi
   try {
     await deps.store.recordSource(message.id);
   } catch (err) {
+    // The details stay in the server log: they can name paths the author must not see.
+    console.error(`DM relay could not mark a forwarded message: ${(err as Error).message}`);
     await notify(
       message,
       deps,
-      `${FAILURE_PREFIX}I could not deliver this to <@${route.peer}>: the relay cannot save it right now (${(err as Error).message}).`,
+      `${FAILURE_PREFIX}I could not deliver this to <@${route.peer}>: the relay cannot save it right now. Please try again later.`,
     );
     return;
   }
@@ -132,6 +134,7 @@ export async function handleRelayDm(message: IncomingDm, deps: RelayDeps): Promi
       sent.push(...(await sendChunk(deps, route.peer, content, last ? files : [])));
     }
   } catch (err) {
+    console.error(`DM relay could not deliver to ${route.peer}: ${(err as Error).message}`);
     if (sent.length)
       await bestEffort("save a partial delivery", () =>
         deps.store.record(sent, route.peer, author),
@@ -139,13 +142,21 @@ export async function handleRelayDm(message: IncomingDm, deps: RelayDeps): Promi
     await notify(
       message,
       deps,
-      `${FAILURE_PREFIX}I could not deliver this to <@${route.peer}>: ${(err as Error).message}`,
+      `${FAILURE_PREFIX}I could not deliver this to <@${route.peer}>: ${publicReason(err)}`,
     );
     return;
   }
   // Delivered: a store failure from here on must not hide that from the author.
   await bestEffort("save a delivery", () => deps.store.record(sent, route.peer, author));
   await message.react("✅").catch(() => {});
+}
+
+/**
+ * What a person may read about a failed delivery: Discord's own explanation, such as a
+ * recipient who closed their DMs, and nothing from inside the server.
+ */
+function publicReason(err: unknown): string {
+  return err instanceof DiscordAPIError ? err.message : "something went wrong on my side";
 }
 
 /**

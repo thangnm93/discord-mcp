@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MessageCreateOptions } from "discord.js";
+import { DiscordAPIError, type MessageCreateOptions } from "discord.js";
 import {
   RELAY_MAX_LINKS,
   RELAY_RETENTION_MS,
@@ -256,7 +256,7 @@ type Route = Awaited<ReturnType<RelayDeps["store"]["resolve"]>>;
 
 function fakeDeps(
   route: Route,
-  opts: { failSend?: boolean; failRecord?: boolean; failSource?: boolean } = {},
+  opts: { failSend?: "discord" | "internal"; failRecord?: boolean; failSource?: boolean } = {},
 ) {
   const sent: Sent[] = [];
   const recorded: { ids: string[]; owner: string; peer: string }[] = [];
@@ -284,7 +284,16 @@ function fakeDeps(
       },
     },
     sendDm: async (userId, options) => {
-      if (opts.failSend) throw new Error("Cannot send messages to this user");
+      if (opts.failSend === "discord")
+        throw new DiscordAPIError(
+          { code: 50007, message: "Cannot send messages to this user" },
+          50007,
+          403,
+          "POST",
+          "https://discord.com/api/v10/channels/1/messages",
+          {},
+        );
+      if (opts.failSend) throw new Error("connect ECONNREFUSED 10.0.0.12:443");
       sent.push({ userId, options });
       return String(next++);
     },
@@ -399,6 +408,7 @@ test("nothing is forwarded when the message cannot first be marked as relayed", 
   await handleRelayDm(message, deps);
   assert.equal(sent.length, 0, "fails closed: an unmarked message would show in DM reads");
   assert.match(calls.replies[0], /could not deliver.*cannot save it right now/);
+  assert.doesNotMatch(calls.replies[0], /EROFS/, "store details stay in the server log");
   assert.deepEqual(calls.reactions, []);
 });
 
@@ -416,11 +426,28 @@ test("bots, server messages and DMs outside a relay are ignored", async () => {
 });
 
 test("a failed delivery is explained to the author with a recorded notice", async () => {
-  const { deps, sources, notices } = fakeDeps({ kind: "peer", peer: SENDER }, { failSend: true });
+  mock.method(console, "error", () => {});
+  const { deps, sources, notices } = fakeDeps(
+    { kind: "peer", peer: SENDER },
+    { failSend: "discord" },
+  );
   const { message, calls } = fakeMessage({ content: "hi" });
   await handleRelayDm(message, deps);
   assert.match(calls.replies[0], /could not deliver.*Cannot send messages to this user/);
   assert.deepEqual(notices, ["reply1"]);
   assert.deepEqual(sources, [INCOMING], "marked before the attempt, so it stays hidden");
   assert.deepEqual(calls.reactions, []);
+});
+
+test("an internal delivery error reaches the author only as a generic reason", async () => {
+  const errors = mock.method(console, "error", () => {});
+  const { deps } = fakeDeps({ kind: "peer", peer: SENDER }, { failSend: "internal" });
+  const { message, calls } = fakeMessage({ content: "hi" });
+  await handleRelayDm(message, deps);
+  assert.match(calls.replies[0], /could not deliver.*something went wrong on my side/);
+  assert.doesNotMatch(calls.replies[0], /ECONNREFUSED|10\.0\.0\.12/);
+  assert.ok(
+    errors.mock.calls.some((c) => String(c.arguments[0]).includes("ECONNREFUSED")),
+    "the details are logged",
+  );
 });
