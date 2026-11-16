@@ -41,10 +41,29 @@ function stubTextChannel(refuse: string[] = []) {
         return { id: THREAD, name: options.name, members };
       },
     },
+    messages: {
+      fetch: async () => ({
+        startThread: async (options: Record<string, unknown>) => {
+          created.push({ ...options, fromMessage: true });
+          return { id: THREAD, name: options.name, members };
+        },
+      }),
+    },
   });
   mock.method(discord.channels, "fetch", async () => channel as never);
   return Object.assign(created, { added });
 }
+
+/** Discord's refusal of a member change on an archived thread. */
+const archivedError = () =>
+  new DiscordAPIError(
+    { code: 50083, message: "Thread is archived" },
+    50083,
+    400,
+    "PUT",
+    "https://discord.com/api/v10/channels/x/thread-members/y",
+    {},
+  );
 
 /** A thread channel recording member additions and removals. */
 function stubThread(overrides: Record<string, unknown> = {}) {
@@ -164,38 +183,46 @@ test("thread member tools refuse a channel that is not a thread", async () => {
     );
 });
 
-test("thread member tools unarchive an archived thread first, and say so", async () => {
+test("an archived thread Discord accepts changes on stays archived", async () => {
   for (const name of ["discord_add_thread_member", "discord_remove_thread_member"]) {
     const calls = stubThread({ archived: true });
     const result = await handler(name)({ thread_id: THREAD, user_id: USER });
-    assert.equal(calls.unarchived, 1, name);
+    assert.equal(calls.unarchived, 0, name);
     assert.equal(calls.added.length + calls.removed.length, 1, name);
+    assert.doesNotMatch(textOf(result), /open again/, name);
+    mock.restoreAll();
+  }
+});
+
+test("when Discord refuses because the thread is archived, it is unarchived and the call retried", async () => {
+  for (const [name, op] of [
+    ["discord_add_thread_member", "add"],
+    ["discord_remove_thread_member", "remove"],
+  ] as const) {
+    let attempts = 0;
+    const done: string[] = [];
+    const change = async (user: string) => {
+      if (++attempts === 1) throw archivedError();
+      done.push(user);
+      return user;
+    };
+    const calls = stubThread({ archived: true, members: { add: change, remove: change } });
+    const result = await handler(name)({ thread_id: THREAD, user_id: USER });
+    assert.equal(calls.unarchived, 1, name);
+    assert.equal(attempts, 2, `${op}: one retry`);
+    assert.deepEqual(done, [USER], name);
     assert.match(textOf(result), /was archived and is now open again/, name);
     mock.restoreAll();
   }
 });
 
-test("removing someone who is not in the thread succeeds without changing anything", async () => {
-  const unknown = new DiscordAPIError(
-    { code: 10007, message: "Unknown Member" },
-    10007,
-    404,
-    "DELETE",
-    "https://discord.com/api/v10/channels/x/thread-members/y",
-    {},
-  );
-  stubThread({
-    members: {
-      remove: async () => {
-        throw unknown;
-      },
-    },
-  });
+test("remove_thread_member words its result so it is true whether or not the user was in the thread", async () => {
+  stubThread();
   const result = await handler("discord_remove_thread_member")({
     thread_id: THREAD,
     user_id: USER,
   });
-  assert.match(textOf(result), /was not a member of thread/);
+  assert.match(textOf(result), new RegExp(`^✅ User ${USER} is not in thread "pair"`));
 });
 
 test("remove_thread_member still surfaces other Discord errors", async () => {
@@ -225,6 +252,31 @@ test("create_thread adds member_ids once each and reports the ones Discord refus
   assert.deepEqual(created.added, [USER]);
   assert.match(textOf(result), /Added 1 of 2 members; could not add 777777777777777777/);
   assert.doesNotMatch(textOf(result), /Add people with/);
+});
+
+test("create_thread adds member_ids to a public thread", async () => {
+  const created = stubTextChannel();
+  const result = await handler("discord_create_thread")({
+    channel_id: CHANNEL,
+    name: "topic",
+    member_ids: [USER],
+  });
+  assert.equal(created[0].type, ChannelType.PublicThread);
+  assert.deepEqual(created.added, [USER]);
+  assert.match(textOf(result), /Added 1 member\./);
+});
+
+test("create_thread adds member_ids to a thread started from a message", async () => {
+  const created = stubTextChannel();
+  const result = await handler("discord_create_thread")({
+    channel_id: CHANNEL,
+    name: "topic",
+    message_id: MESSAGE,
+    member_ids: [USER],
+  });
+  assert.equal(created[0].fromMessage, true);
+  assert.deepEqual(created.added, [USER]);
+  assert.match(textOf(result), /created from message.*Added 1 member\./);
 });
 
 test("create_thread caps member_ids at 50", () => {

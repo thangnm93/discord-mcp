@@ -18,12 +18,12 @@
     "url": "https://github.com/PaSympa/discord-mcp",
     "source": "github"
   },
-  "version": "2.8.0",
+  "version": "2.8.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@thangnm93/discord-mcp",
-      "version": "2.8.0",
+      "version": "2.8.1",
       "transport": {
         "type": "stdio"
       },
@@ -121,7 +121,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "docker.io/pasympa/discord-mcp:2.8.0",
+      "identifier": "docker.io/pasympa/discord-mcp:2.8.1",
       "transport": {
         "type": "stdio"
       },
