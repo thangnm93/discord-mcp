@@ -5,8 +5,8 @@
 ### Added
 
 - DM relay, opt-in with `DISCORD_DM_RELAY=true`: `discord_send_dm` takes `relay_to`, the person a DM is sent for. The DM names them, and the recipient's answers reach them as DMs from the bot, in both directions. A Reply routes to the sender of the message it answers; a plain message goes to the only person who relayed to its author in the last 24 hours, and the bot asks for a Reply when there are several. Links (IDs and timestamps, no content) persist in `DISCORD_DM_RELAY_STORE`
-- `discord_create_thread` takes `private: true` to create a standalone private thread, visible only to its members and moderators, and `invitable` to choose whether members without Manage Threads can add others. `private` refuses `message_id`, since Discord branches only public threads from a message. The README invite link adds Create Private Threads
-- `discord_add_thread_member` and `discord_remove_thread_member` add and remove a member in any thread, the only way to bring someone into a private thread. Both refuse an archived thread before reaching Discord
+- `discord_create_thread` takes `private: true` to create a standalone private thread, visible only to its members and moderators, and `invitable` to choose whether members without Manage Threads can add others. `member_ids` adds up to 50 people in the same call; a refused add is reported and leaves the thread in place. `private` refuses `message_id`, since Discord branches only public threads from a message. The README invite link adds Create Private Threads
+- `discord_add_thread_member` and `discord_remove_thread_member` add and remove a member in any thread, the only way to bring someone into a private thread. Both unarchive an archived thread first, and removing someone who is not in the thread succeeds, so a retry is safe
 
 ## [2.4.0] - 2026-11-15
 

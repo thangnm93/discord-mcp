@@ -179,21 +179,44 @@ const threadMemberShape = z.object({
   user_id: snowflake.describe("Discord user ID (snowflake) of the member."),
 });
 
+/** Discord's answer when the user is not a member of the thread. */
+const UNKNOWN_MEMBER = 10007;
+/** How many people discord_create_thread adds in one call. */
+const MAX_THREAD_MEMBERS = 50;
+
 /**
- * Fetches a thread fresh from Discord, so its archived state is current, and refuses an
- * archived one: Discord rejects member changes there.
+ * Fetches a thread fresh from Discord, so its archived state is current, and unarchives
+ * it: Discord rejects member changes in an archived thread. A locked thread needs Manage
+ * Threads to unarchive, and Discord's error says so.
  */
-async function getOpenThread(threadId: string): Promise<AnyThreadChannel> {
+async function getOpenThread(
+  threadId: string,
+): Promise<{ thread: AnyThreadChannel; unarchived: boolean }> {
   const channel = await fetchChannelChecked(validateId(threadId, "thread_id"), { force: true });
   if (!channel?.isThread())
     throw new Error(
       `Channel ${threadId} is not a thread or doesn't exist. Pass a thread ID; discord_list_channel_threads lists a channel's threads.`,
     );
-  if (channel.archived)
-    throw new Error(
-      `Thread "${channel.name}" (${channel.id}) is archived, and Discord refuses member changes in an archived thread. Unarchive it, for example by sending a message in it, then retry.`,
-    );
-  return channel;
+  if (!channel.archived) return { thread: channel, unarchived: false };
+  await channel.setArchived(false);
+  return { thread: channel, unarchived: true };
+}
+
+/** Adds each user to a new thread, reporting the ones Discord refused instead of failing the call. */
+async function addThreadMembers(thread: AnyThreadChannel, userIds: string[]): Promise<string> {
+  if (userIds.length === 0) return "";
+  const failed: string[] = [];
+  for (const id of new Set(userIds)) {
+    try {
+      await thread.members.add(id);
+    } catch (err) {
+      failed.push(`${id} (${(err as Error).message})`);
+    }
+  }
+  const total = new Set(userIds).size;
+  return failed.length
+    ? ` Added ${total - failed.length} of ${total} members; could not add ${failed.join(", ")}. Retry those with discord_add_thread_member.`
+    : ` Added ${total} member${total === 1 ? "" : "s"}.`;
 }
 
 /** Tool definitions for channel and thread messages. */
@@ -436,7 +459,7 @@ const tools = [
   defineTool({
     name: "discord_create_thread",
     description:
-      "Create a thread, either branching from an existing message (pass message_id) or as a standalone thread in a text channel (omit message_id). Set private to true for a standalone private thread that only its members and moderators can see, then add people with discord_add_thread_member; Discord branches only public threads from a message, so private refuses message_id. Standalone creation requires a parent text channel and fails if channel_id is itself a thread. Requires the Create Public Threads permission (or Create Private Threads for a private thread), plus Read Message History when message_id is set. Returns the new thread's ID.",
+      "Create a thread, either branching from an existing message (pass message_id) or as a standalone thread in a text channel (omit message_id). Set private to true for a standalone private thread that only its members and moderators can see, and member_ids to add people in the same call (or later with discord_add_thread_member); Discord branches only public threads from a message, so private refuses message_id. Standalone creation requires a parent text channel and fails if channel_id is itself a thread. Requires the Create Public Threads permission (or Create Private Threads for a private thread), plus Read Message History when message_id is set and Send Messages in Threads when member_ids is set. Returns the new thread's ID and which members were added.",
     annotations: {
       title: "Create thread",
       readOnlyHint: false,
@@ -473,6 +496,13 @@ const tools = [
           .describe(
             "Optional, private threads only. Whether members without Manage Threads can add other people to the thread. Discord's default is true.",
           ),
+        member_ids: z
+          .array(snowflake)
+          .max(MAX_THREAD_MEMBERS)
+          .optional()
+          .describe(
+            "Optional. Up to 50 Discord user IDs (snowflakes) to add to the new thread, the usual way to fill a private thread. A refused add is reported in the result and leaves the thread in place.",
+          ),
       })
       .refine(
         (args) => !(args.private && args.message_id),
@@ -489,17 +519,19 @@ const tools = [
       auto_archive_duration,
       private: isPrivate,
       invitable,
+      member_ids = [],
     }) => {
       const channel = await getTextChannel(channel_id);
       const duration = auto_archive_duration;
       if (message_id) {
         const msg = await channel.messages.fetch({ message: message_id, cache: false });
         const thread = await msg.startThread({ name, autoArchiveDuration: duration });
+        const added = await addThreadMembers(thread, member_ids);
         return {
           content: [
             {
               type: "text",
-              text: `✅ Thread "${thread.name}" created from message (id: ${thread.id}).`,
+              text: `✅ Thread "${thread.name}" created from message (id: ${thread.id}).${added}`,
             },
           ],
         };
@@ -516,11 +548,13 @@ const tools = [
           type: ChannelType.PrivateThread,
           ...(invitable === undefined ? {} : { invitable }),
         });
+        const added = await addThreadMembers(thread, member_ids);
+        const hint = member_ids.length ? "" : " Add people with discord_add_thread_member.";
         return {
           content: [
             {
               type: "text",
-              text: `✅ Private thread "${thread.name}" created (id: ${thread.id}). Add people with discord_add_thread_member.`,
+              text: `✅ Private thread "${thread.name}" created (id: ${thread.id}).${added}${hint}`,
             },
           ],
         };
@@ -530,15 +564,18 @@ const tools = [
         autoArchiveDuration: duration,
         type: ChannelType.PublicThread,
       });
+      const added = await addThreadMembers(thread, member_ids);
       return {
-        content: [{ type: "text", text: `✅ Thread "${thread.name}" created (id: ${thread.id}).` }],
+        content: [
+          { type: "text", text: `✅ Thread "${thread.name}" created (id: ${thread.id}).${added}` },
+        ],
       };
     },
   }),
   defineTool({
     name: "discord_add_thread_member",
     description:
-      "Add a member to a thread. This is how people join a private thread, which they cannot open otherwise; in a public thread it makes them follow it. Works on any thread, forum posts included. Adding someone already in the thread changes nothing. The member must be able to view the parent channel, and the thread must not be archived. Requires the Send Messages in Threads permission. Returns a confirmation. Use discord_remove_thread_member to take someone out, or discord_create_thread with private set to create a private thread.",
+      "Add a member to a thread. This is how people join a private thread, which they cannot open otherwise; in a public thread it makes them follow it. Works on any thread, forum posts included. Adding someone already in the thread changes nothing. The member must be able to view the parent channel. An archived thread is unarchived first, which needs Manage Threads when it is locked. Requires the Send Messages in Threads permission. Returns a confirmation. Use discord_remove_thread_member to take someone out, or discord_create_thread with private set to create a private thread.",
     annotations: {
       title: "Add thread member",
       readOnlyHint: false,
@@ -548,13 +585,14 @@ const tools = [
     },
     schema: threadMemberShape,
     handle: async ({ thread_id, user_id }) => {
-      const thread = await getOpenThread(thread_id);
+      const { thread, unarchived } = await getOpenThread(thread_id);
       await thread.members.add(user_id);
+      const note = unarchived ? " The thread was archived and is now open again." : "";
       return {
         content: [
           {
             type: "text",
-            text: `✅ User ${user_id} added to thread "${thread.name}" (${thread.id}).`,
+            text: `✅ User ${user_id} added to thread "${thread.name}" (${thread.id}).${note}`,
           },
         ],
       };
@@ -563,7 +601,7 @@ const tools = [
   defineTool({
     name: "discord_remove_thread_member",
     description:
-      "Remove a member from a thread. In a private thread they lose access until someone adds them again; in a public thread they only stop following it and can still open it. The thread must not be archived. Requires the Manage Threads permission, unless the bot created the private thread. Returns a confirmation. Use discord_add_thread_member to add someone back.",
+      "Remove a member from a thread. In a private thread they lose access until someone adds them again; in a public thread they only stop following it and can still open it. Removing someone who is not in the thread changes nothing. An archived thread is unarchived first. Requires the Manage Threads permission, unless the bot created the private thread. Returns a confirmation. Use discord_add_thread_member to add someone back.",
     annotations: {
       title: "Remove thread member",
       readOnlyHint: false,
@@ -573,13 +611,20 @@ const tools = [
     },
     schema: threadMemberShape,
     handle: async ({ thread_id, user_id }) => {
-      const thread = await getOpenThread(thread_id);
-      await thread.members.remove(user_id);
+      const { thread, unarchived } = await getOpenThread(thread_id);
+      let state = "removed from";
+      try {
+        await thread.members.remove(user_id);
+      } catch (err) {
+        if (!(err instanceof DiscordAPIError && err.code === UNKNOWN_MEMBER)) throw err;
+        state = "was not a member of";
+      }
+      const note = unarchived ? " The thread was archived and is now open again." : "";
       return {
         content: [
           {
             type: "text",
-            text: `✅ User ${user_id} removed from thread "${thread.name}" (${thread.id}).`,
+            text: `✅ User ${user_id} ${state} thread "${thread.name}" (${thread.id}).${note}`,
           },
         ],
       };

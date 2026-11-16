@@ -1,7 +1,7 @@
 import { test, mock, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { ZodError } from "zod";
-import { ChannelType, TextChannel } from "discord.js";
+import { ChannelType, DiscordAPIError, TextChannel } from "discord.js";
 import { discord } from "../src/client.js";
 import messages from "../src/tools/messages.js";
 
@@ -18,8 +18,16 @@ const textOf = (result: { content: { type: string; text?: string }[] }) =>
   result.content.map((c) => c.text ?? "").join("\n");
 
 /** A parent text channel that passes `instanceof TextChannel`, recording thread creations. */
-function stubTextChannel() {
+function stubTextChannel(refuse: string[] = []) {
   const created: Record<string, unknown>[] = [];
+  const added: string[] = [];
+  const members = {
+    add: async (user: string) => {
+      if (refuse.includes(user)) throw new Error("Missing Access");
+      added.push(user);
+      return user;
+    },
+  };
   const channel = Object.assign(Object.create(TextChannel.prototype) as object, {
     id: CHANNEL,
     name: "general",
@@ -30,17 +38,17 @@ function stubTextChannel() {
     threads: {
       create: async (options: Record<string, unknown>) => {
         created.push(options);
-        return { id: THREAD, name: options.name };
+        return { id: THREAD, name: options.name, members };
       },
     },
   });
   mock.method(discord.channels, "fetch", async () => channel as never);
-  return created;
+  return Object.assign(created, { added });
 }
 
 /** A thread channel recording member additions and removals. */
 function stubThread(overrides: Record<string, unknown> = {}) {
-  const calls = { added: [] as string[], removed: [] as string[] };
+  const calls = { added: [] as string[], removed: [] as string[], unarchived: 0 };
   const thread = {
     id: THREAD,
     name: "pair",
@@ -49,6 +57,10 @@ function stubThread(overrides: Record<string, unknown> = {}) {
     isThread: () => true,
     isDMBased: () => false,
     isTextBased: () => true,
+    archived: false,
+    setArchived: async (archived: boolean) => {
+      if (!archived) calls.unarchived++;
+    },
     members: {
       add: async (user: string) => {
         calls.added.push(user);
@@ -152,11 +164,74 @@ test("thread member tools refuse a channel that is not a thread", async () => {
     );
 });
 
-test("thread member tools refuse an archived thread with a clear error", async () => {
-  const calls = stubThread({ archived: true });
-  for (const name of ["discord_add_thread_member", "discord_remove_thread_member"])
-    await assert.rejects(handler(name)({ thread_id: THREAD, user_id: USER }), /archived/, name);
-  assert.deepEqual(calls, { added: [], removed: [] }, "nothing reaches Discord");
+test("thread member tools unarchive an archived thread first, and say so", async () => {
+  for (const name of ["discord_add_thread_member", "discord_remove_thread_member"]) {
+    const calls = stubThread({ archived: true });
+    const result = await handler(name)({ thread_id: THREAD, user_id: USER });
+    assert.equal(calls.unarchived, 1, name);
+    assert.equal(calls.added.length + calls.removed.length, 1, name);
+    assert.match(textOf(result), /was archived and is now open again/, name);
+    mock.restoreAll();
+  }
+});
+
+test("removing someone who is not in the thread succeeds without changing anything", async () => {
+  const unknown = new DiscordAPIError(
+    { code: 10007, message: "Unknown Member" },
+    10007,
+    404,
+    "DELETE",
+    "https://discord.com/api/v10/channels/x/thread-members/y",
+    {},
+  );
+  stubThread({
+    members: {
+      remove: async () => {
+        throw unknown;
+      },
+    },
+  });
+  const result = await handler("discord_remove_thread_member")({
+    thread_id: THREAD,
+    user_id: USER,
+  });
+  assert.match(textOf(result), /was not a member of thread/);
+});
+
+test("remove_thread_member still surfaces other Discord errors", async () => {
+  stubThread({
+    members: {
+      remove: async () => {
+        throw new Error("Missing Permissions");
+      },
+    },
+  });
+  await assert.rejects(
+    handler("discord_remove_thread_member")({ thread_id: THREAD, user_id: USER }),
+    /Missing Permissions/,
+  );
+});
+
+test("create_thread adds member_ids once each and reports the ones Discord refused", async () => {
+  const OTHER = "777777777777777777";
+  const created = stubTextChannel([OTHER]);
+  const result = await handler("discord_create_thread")({
+    channel_id: CHANNEL,
+    name: "pair",
+    private: true,
+    member_ids: [USER, USER, OTHER],
+  });
+  assert.equal(created.length, 1, "the thread stays created");
+  assert.deepEqual(created.added, [USER]);
+  assert.match(textOf(result), /Added 1 of 2 members; could not add 777777777777777777/);
+  assert.doesNotMatch(textOf(result), /Add people with/);
+});
+
+test("create_thread caps member_ids at 50", () => {
+  const definition = messages.definitions.find((d) => d.name === "discord_create_thread");
+  const props = (definition!.inputSchema as { properties: Record<string, { maxItems?: number }> })
+    .properties;
+  assert.equal(props.member_ids.maxItems, 50);
 });
 
 test("thread member tools are idempotent writes, not destructive", () => {
