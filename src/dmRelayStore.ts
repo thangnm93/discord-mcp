@@ -54,6 +54,30 @@ export function dmRelayCallerHeader(): string | undefined {
   return raw;
 }
 
+/**
+ * The key in a tools/call request's `_meta` where a trusted gateway sets the caller's
+ * Discord user ID (`DISCORD_DM_RELAY_CALLER_META`). Unlike a header, it travels over
+ * every transport, stdio included.
+ */
+export function dmRelayCallerMetaKey(): string | undefined {
+  const raw = process.env.DISCORD_DM_RELAY_CALLER_META?.trim();
+  if (!raw) return undefined;
+  if (!/^[A-Za-z0-9._/-]+$/.test(raw))
+    throw new Error(
+      `Invalid DISCORD_DM_RELAY_CALLER_META: "${raw}". Use a key such as gateway/discordUserId.`,
+    );
+  return raw;
+}
+
+/** Where a gateway names callers, for messages, or undefined when the server does not know them. */
+export function dmRelayCallerSource(): string | undefined {
+  const header = dmRelayCallerHeader();
+  const meta = dmRelayCallerMetaKey();
+  const sources = [header && `the ${header} header`, meta && `the _meta key ${meta}`];
+  const named = sources.filter((s): s is string => Boolean(s));
+  return named.length ? named.join(" or ") : undefined;
+}
+
 /** A bot message in `owner`'s DM whose replies go to `peer`. */
 export interface RelayLink {
   owner: string;

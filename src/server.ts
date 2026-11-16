@@ -6,7 +6,7 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { callerFromHeaders, runAsCaller } from "./caller.js";
+import { callerFromRequest, runAsCaller } from "./caller.js";
 import { ensureConnected } from "./client.js";
 import { formatToolError } from "./errors.js";
 import { getAllDefinitions, handleTool, hasTool } from "./tools/index.js";
@@ -45,7 +45,10 @@ export function createServer(version: string): Server {
 
     try {
       await ensureConnected();
-      const caller = callerFromHeaders(extra.requestInfo?.headers);
+      const caller = callerFromRequest({
+        headers: extra.requestInfo?.headers,
+        meta: req.params._meta,
+      });
       return await runAsCaller(caller, () => handleTool(name, args));
     } catch (err: unknown) {
       return {

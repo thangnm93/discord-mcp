@@ -68,7 +68,7 @@ async function callAs(caller: string | undefined, relay_to: string) {
 test("over http, relay_to must match the gateway header", async () => {
   const missing = await callAs(undefined, SENDER);
   assert.equal(missing.isError, true);
-  assert.match(missing.text, /no valid x-discord-user-id header/);
+  assert.match(missing.text, /no valid caller in the x-discord-user-id header/);
 
   const other = await callAs("333333333333333333", SENDER);
   assert.equal(other.isError, true);

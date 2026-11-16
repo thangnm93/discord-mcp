@@ -3,7 +3,7 @@ import { discord } from "../client.js";
 import { buildEmbed, embedFieldsShape } from "../embeds.js";
 import { currentCaller } from "../caller.js";
 import { dmRelayLimiter, dmRelayStore, relayHeader } from "../dmRelay.js";
-import { dmRelayCallerHeader, dmRelayEnabled } from "../dmRelayStore.js";
+import { dmRelayCallerSource, dmRelayEnabled } from "../dmRelayStore.js";
 import {
   defineTool,
   defineModule,
@@ -20,21 +20,21 @@ const MAX_DM_CONTENT = 2000;
 const userId = snowflake.describe("Discord user ID (snowflake) of the DM recipient.");
 
 /**
- * Checks that the caller may send a DM for `relayTo`. With DISCORD_DM_RELAY_CALLER_HEADER
- * set, the gateway's header names the caller and relay_to must be that person; without
- * it, relay_to is taken on trust. Either way, one sender gets a bounded number per window.
+ * Checks that the caller may send a DM for `relayTo`. When a gateway names callers
+ * (DISCORD_DM_RELAY_CALLER_HEADER or DISCORD_DM_RELAY_CALLER_META), relay_to must be that
+ * person; otherwise relay_to is taken on trust. Either way, one sender gets a bounded number per window.
  */
 function authorizeRelay(relayTo: string): void {
   if (!dmRelayEnabled())
     throw new Error(
       "relay_to needs the DM relay, which is off on this server. Start it with DISCORD_DM_RELAY=true, or send without relay_to.",
     );
-  const header = dmRelayCallerHeader();
-  if (header) {
+  const source = dmRelayCallerSource();
+  if (source) {
     const caller = currentCaller().discordUserId;
     if (!caller)
       throw new Error(
-        `relay_to needs to know who is calling, and this request has no valid ${header} header. Call through the gateway that sets it.`,
+        `relay_to needs to know who is calling, and this request names no valid caller in ${source}. Call through the gateway that sets it.`,
       );
     if (caller !== relayTo)
       throw new Error(
@@ -50,10 +50,10 @@ function authorizeRelay(relayTo: string): void {
 
 /**
  * Whether the caller may see relayed messages in this DM. Only the person the DM is with
- * may, and only when a gateway header proves who is calling.
+ * may, and only when a gateway proves who is calling.
  */
 function canReadRelayed(dmUserId: string): boolean {
-  return Boolean(dmRelayCallerHeader()) && currentCaller().discordUserId === dmUserId;
+  return Boolean(dmRelayCallerSource()) && currentCaller().discordUserId === dmUserId;
 }
 const messageId = snowflake.describe("ID of the target message within the DM conversation.");
 
@@ -62,7 +62,7 @@ const tools = [
   defineTool({
     name: "discord_send_dm",
     description:
-      "Send a private direct message to a user by their user ID. Use discord_send_message to post in a server channel instead. Set relay_to to send on behalf of a person: the DM opens with their name, and the recipient's answers reach them as DMs from the bot, in both directions, when the server runs with DISCORD_DM_RELAY=true. Behind a gateway that names callers, relay_to must be the caller's own ID; each sender may start a limited number of relayed DMs per 10 minutes. Requires the bot to share at least one server with the user, and the user must allow DMs from server members (otherwise Discord rejects the send). Returns the new message ID.",
+      "Send a private direct message to a user by their user ID. Use discord_send_message to post in a server channel instead. Set relay_to to send on behalf of a person: the DM opens with their name, and the recipient's answers reach them as DMs from the bot, in both directions, when the server runs with DISCORD_DM_RELAY=true. Behind a gateway that names callers (a header or request _meta), relay_to must be the caller's own ID; each sender may start a limited number of relayed DMs per 10 minutes. Requires the bot to share at least one server with the user, and the user must allow DMs from server members (otherwise Discord rejects the send). Returns the new message ID.",
     annotations: {
       title: "Send DM",
       readOnlyHint: false,
@@ -251,7 +251,7 @@ const tools = [
   defineTool({
     name: "discord_read_dms",
     description:
-      "Read the most recent messages from the bot's DM conversation with a user, oldest-to-newest. Returns { messages: [...] } with id, author, content, embed count, timestamp. With the DM relay on, messages relayed between people are left out and counted in hidden_relayed, unless a gateway header shows the caller is that user. Read-only.",
+      "Read the most recent messages from the bot's DM conversation with a user, oldest-to-newest. Returns { messages: [...] } with id, author, content, embed count, timestamp. With the DM relay on, messages relayed between people are left out and counted in hidden_relayed, unless a gateway (header or request _meta) shows the caller is that user. Read-only.",
     annotations: { title: "Read DMs", readOnlyHint: true, openWorldHint: true },
     schema: z.object({
       user_id: userId,

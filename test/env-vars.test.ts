@@ -86,6 +86,7 @@ const HTTP_ONLY = new Set([
   "DISCORD_DM_RELAY",
   "DISCORD_DM_RELAY_STORE",
   "DISCORD_DM_RELAY_CALLER_HEADER",
+  "DISCORD_DM_RELAY_CALLER_META",
 ]);
 
 test("manifest.json maps every env var src/ reads except the HTTP-only ones, and only those", () => {

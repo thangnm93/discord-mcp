@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ZodError } from "zod";
-import { callerFromHeaders, runAsCaller } from "../src/caller.js";
+import { callerFromHeaders, callerFromRequest, runAsCaller } from "../src/caller.js";
 import { discord } from "../src/client.js";
 import { dmRelayLimiter, dmRelayStore } from "../src/dmRelay.js";
 import { RELAY_RATE_MAX } from "../src/dmRelayStore.js";
@@ -23,6 +23,7 @@ afterEach(() => {
   mock.restoreAll();
   delete process.env.DISCORD_DM_RELAY;
   delete process.env.DISCORD_DM_RELAY_CALLER_HEADER;
+  delete process.env.DISCORD_DM_RELAY_CALLER_META;
 });
 
 const sendDm = () => dm.handlers.get("discord_send_dm")!;
@@ -164,7 +165,7 @@ test("behind a gateway header, relay_to must be the caller", async () => {
   const call = (relay_to: string) => () =>
     sendDm()({ user_id: RECIPIENT, content: "hi", relay_to });
 
-  await assert.rejects(call(SENDER)(), /no valid x-discord-user-id header/);
+  await assert.rejects(call(SENDER)(), /no valid caller in the x-discord-user-id header/);
   const caller = callerFromHeaders({ "x-discord-user-id": "444444444444444444" });
   await assert.rejects(runAsCaller(caller, call(SENDER)), /must be your own Discord user ID/);
   assert.equal(sent.length, 0);
@@ -219,4 +220,39 @@ test("read_dms fails closed when the relay store cannot be read", async () => {
     throw new Error("store unreadable");
   });
   await assert.rejects(readDms()({ user_id: RECIPIENT }), /store unreadable/);
+});
+
+test("callerFromRequest reads the _meta key, and fails closed on a bad or conflicting value", () => {
+  process.env.DISCORD_DM_RELAY_CALLER_META = "gateway/discordUserId";
+  const meta = (value: unknown) => ({ meta: { "gateway/discordUserId": value } });
+  assert.deepEqual(callerFromRequest(meta(SENDER)), { discordUserId: SENDER });
+  assert.deepEqual(callerFromRequest(meta(Number(SENDER))), {}, "not a string");
+  assert.deepEqual(callerFromRequest(meta("abc")), {});
+  assert.deepEqual(callerFromRequest({ meta: { other: SENDER } }), {});
+  assert.deepEqual(callerFromRequest({}), {});
+
+  process.env.DISCORD_DM_RELAY_CALLER_HEADER = "x-discord-user-id";
+  const both = (header: string, metaValue: string) => ({
+    headers: { "x-discord-user-id": header },
+    meta: { "gateway/discordUserId": metaValue },
+  });
+  assert.deepEqual(callerFromRequest(both(SENDER, SENDER)), { discordUserId: SENDER });
+  assert.deepEqual(callerFromRequest(both(SENDER, RECIPIENT)), {}, "sources disagree");
+  assert.deepEqual(callerFromRequest(both("bad", SENDER)), {}, "one source is malformed");
+});
+
+test("behind a _meta gateway, relay_to must be the caller and read_dms shows them their DM", async () => {
+  process.env.DISCORD_DM_RELAY = "true";
+  process.env.DISCORD_DM_RELAY_CALLER_META = "gateway/discordUserId";
+  const sent = stubUser();
+  await assert.rejects(
+    sendDm()({ user_id: RECIPIENT, content: "hi", relay_to: SENDER }),
+    /no valid caller in the _meta key gateway\/discordUserId/,
+  );
+  const self = callerFromRequest({ meta: { "gateway/discordUserId": SENDER } });
+  const result = await runAsCaller(self, () =>
+    sendDm()({ user_id: RECIPIENT, content: "hi", relay_to: SENDER }),
+  );
+  assert.match(textOf(result), /relayed to user/);
+  assert.equal(sent.length, 1);
 });

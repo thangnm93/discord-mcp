@@ -11,6 +11,8 @@ import {
   RelayRateLimiter,
   RelayStore,
   dmRelayCallerHeader,
+  dmRelayCallerMetaKey,
+  dmRelayCallerSource,
   dmRelayEnabled,
   emptyRelayState,
   loadRelayState,
@@ -35,6 +37,7 @@ afterEach(() => {
   mock.restoreAll();
   delete process.env.DISCORD_DM_RELAY;
   delete process.env.DISCORD_DM_RELAY_CALLER_HEADER;
+  delete process.env.DISCORD_DM_RELAY_CALLER_META;
 });
 
 // ─── Config ────────────────────────────────────────────────────────────────────
@@ -59,6 +62,21 @@ test("DISCORD_DM_RELAY_CALLER_HEADER is lowercased, and a malformed name stops t
   assert.equal(dmRelayCallerHeader(), "x-discord-user-id");
   process.env.DISCORD_DM_RELAY_CALLER_HEADER = "x discord";
   assert.throws(() => dmRelayCallerHeader(), /Invalid DISCORD_DM_RELAY_CALLER_HEADER/);
+});
+
+test("DISCORD_DM_RELAY_CALLER_META takes a _meta key, and the source names what is set", () => {
+  assert.equal(dmRelayCallerMetaKey(), undefined);
+  assert.equal(dmRelayCallerSource(), undefined);
+  process.env.DISCORD_DM_RELAY_CALLER_META = "gateway/discordUserId";
+  assert.equal(dmRelayCallerMetaKey(), "gateway/discordUserId");
+  assert.equal(dmRelayCallerSource(), "the _meta key gateway/discordUserId");
+  process.env.DISCORD_DM_RELAY_CALLER_HEADER = "x-discord-user-id";
+  assert.equal(
+    dmRelayCallerSource(),
+    "the x-discord-user-id header or the _meta key gateway/discordUserId",
+  );
+  process.env.DISCORD_DM_RELAY_CALLER_META = "bad key";
+  assert.throws(() => dmRelayCallerMetaKey(), /Invalid DISCORD_DM_RELAY_CALLER_META/);
 });
 
 // ─── Routing rules ─────────────────────────────────────────────────────────────
