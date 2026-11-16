@@ -5,6 +5,7 @@ import {
   GatewayIntentBits,
   GuildChannel,
   Options,
+  Partials,
   PermissionFlagsBits,
   PermissionsBitField,
   type ChannelFlagsBitField,
@@ -13,6 +14,7 @@ import {
   type ThreadChannel,
 } from "discord.js";
 import { SWEEP } from "./constants.js";
+import { dmRelayEnabled } from "./dmRelayStore.js";
 
 /**
  * Initializes the Discord.js client with the gateway intents (privileged ones
@@ -38,6 +40,8 @@ function envEnabled(name: string): boolean {
 
 const messageContentEnabled = envEnabled("DISCORD_MESSAGE_CONTENT");
 const guildMembersEnabled = envEnabled("DISCORD_GUILD_MEMBERS");
+/** The DM relay hears DMs to the bot; DM channels arrive uncached, hence the Channel partial. */
+const dmRelayOn = dmRelayEnabled();
 
 export const discord = new Client({
   // No GuildMessages: nothing consumes MessageCreate, yet it caches every message plus
@@ -47,7 +51,9 @@ export const discord = new Client({
     GatewayIntentBits.GuildScheduledEvents,
     ...(messageContentEnabled ? [GatewayIntentBits.MessageContent] : []),
     ...(guildMembersEnabled ? [GatewayIntentBits.GuildMembers] : []),
+    ...(dmRelayOn ? [GatewayIntentBits.DirectMessages] : []),
   ],
+  ...(dmRelayOn ? { partials: [Partials.Channel] } : {}),
   rest: { retries: 3, timeout: 15_000 },
   sweepers: {
     ...Options.DefaultSweeperSettings,

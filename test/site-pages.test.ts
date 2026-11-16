@@ -1456,7 +1456,15 @@ const DOC_NAMES: Record<string, string> = {
 const navOf = (html: string) =>
   /<nav class="nav" id="site-nav" aria-label="Site">([\s\S]*?)<\/nav>/.exec(html)![1];
 const srcText = () =>
-  ["client.ts", "errors.ts", "http.ts", "index.ts", "tools/index.ts", "tools/discovery.ts"]
+  [
+    "client.ts",
+    "dmRelayStore.ts",
+    "errors.ts",
+    "http.ts",
+    "index.ts",
+    "tools/index.ts",
+    "tools/discovery.ts",
+  ]
     .map((file) => readFileSync(join(__dirname, "..", "src", file), "utf8"))
     .join("\n");
 

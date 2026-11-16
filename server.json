@@ -18,12 +18,12 @@
     "url": "https://github.com/PaSympa/discord-mcp",
     "source": "github"
   },
-  "version": "2.5.0",
+  "version": "2.6.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@thangnm93/discord-mcp",
-      "version": "2.5.0",
+      "version": "2.6.0",
       "transport": {
         "type": "stdio"
       },
@@ -95,12 +95,23 @@
           "description": "Comma-separated hostnames, without port, accepted in the Host header of HTTP requests besides localhost, 127.0.0.1 and [::1], such as the public name a reverse proxy forwards.",
           "format": "string",
           "placeholder": "discord-mcp.example.com"
+        },
+        {
+          "name": "DISCORD_DM_RELAY",
+          "description": "Set to true to relay answers to DMs sent with relay_to back to their sender. Keeps the bot connected and stores who wrote to whom. Accepts true/false, 1/0, yes/no or on/off; any other value stops the server at startup.",
+          "format": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "DISCORD_DM_RELAY_STORE",
+          "description": "File where the DM relay keeps its links. Default ~/.discord-mcp/dm-relay.json.",
+          "format": "string"
         }
       ]
     },
     {
       "registryType": "oci",
-      "identifier": "docker.io/pasympa/discord-mcp:2.5.0",
+      "identifier": "docker.io/pasympa/discord-mcp:2.6.0",
       "transport": {
         "type": "stdio"
       },
@@ -172,6 +183,17 @@
           "description": "Comma-separated hostnames, without port, accepted in the Host header of HTTP requests besides localhost, 127.0.0.1 and [::1], such as the public name a reverse proxy forwards.",
           "format": "string",
           "placeholder": "discord-mcp.example.com"
+        },
+        {
+          "name": "DISCORD_DM_RELAY",
+          "description": "Set to true to relay answers to DMs sent with relay_to back to their sender. Keeps the bot connected and stores who wrote to whom. Accepts true/false, 1/0, yes/no or on/off; any other value stops the server at startup.",
+          "format": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "DISCORD_DM_RELAY_STORE",
+          "description": "File where the DM relay keeps its links. Default ~/.discord-mcp/dm-relay.json.",
+          "format": "string"
         }
       ]
     }

@@ -10,6 +10,8 @@ import type { Server } from "http";
 import type { AddressInfo } from "net";
 import { join } from "path";
 import { discord } from "./client.js";
+import { startDmRelay } from "./dmRelay.js";
+import { dmRelayEnabled } from "./dmRelayStore.js";
 import { createServer } from "./server.js";
 
 const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
@@ -32,7 +34,10 @@ function selectTransport(): "stdio" | "http" {
 }
 
 async function main() {
-  if (selectTransport() === "http") return serveHttp();
+  const mode = selectTransport();
+  // The relay listens for DMs from startup, not from the first tool call.
+  if (dmRelayEnabled()) startDmRelay();
+  if (mode === "http") return serveHttp();
   const transport = new StdioServerTransport();
   await createServer(version).connect(transport);
   console.error(`Discord MCP Server v${version} running on stdio.`);

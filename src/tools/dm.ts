@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { discord } from "../client.js";
 import { buildEmbed, embedFieldsShape } from "../embeds.js";
+import { dmRelayStore, relayHeader } from "../dmRelay.js";
+import { dmRelayEnabled } from "../dmRelayStore.js";
+
+/** Discord's limit for the content of one message. */
+const MAX_DM_CONTENT = 2000;
 import {
   defineTool,
   defineModule,
@@ -19,7 +24,7 @@ const tools = [
   defineTool({
     name: "discord_send_dm",
     description:
-      "Send a private direct message to a user by their user ID. Use discord_send_message to post in a server channel instead. Requires the bot to share at least one server with the user, and the user must allow DMs from server members (otherwise Discord rejects the send). Returns the new message ID.",
+      "Send a private direct message to a user by their user ID. Use discord_send_message to post in a server channel instead. Set relay_to to send on behalf of a person: the DM opens with their name, and the recipient's answers reach them as DMs from the bot, in both directions, when the server runs with DISCORD_DM_RELAY=true. Requires the bot to share at least one server with the user, and the user must allow DMs from server members (otherwise Discord rejects the send). Returns the new message ID.",
     annotations: {
       title: "Send DM",
       readOnlyHint: false,
@@ -27,16 +32,42 @@ const tools = [
       idempotentHint: false,
       openWorldHint: true,
     },
-    schema: z.object({
-      user_id: userId,
-      content: z.string().describe("Plain-text body of the DM (max 2000 characters)."),
-    }),
-    handle: async ({ user_id, content }) => {
+    schema: z
+      .object({
+        user_id: userId,
+        content: z.string().describe("Plain-text body of the DM (max 2000 characters)."),
+        relay_to: snowflake
+          .optional()
+          .describe(
+            "Optional. Discord user ID (snowflake) of the person the DM is sent for. Their name heads the DM, which leaves less room for content, and the recipient's answers are relayed to them. Needs DISCORD_DM_RELAY=true on the server.",
+          ),
+      })
+      .refine(
+        (args) => args.relay_to !== args.user_id,
+        "relay_to must differ from user_id: the recipient's answers would come back to them.",
+      ),
+    handle: async ({ user_id, content, relay_to }) => {
+      if (relay_to && !dmRelayEnabled())
+        throw new Error(
+          "relay_to needs the DM relay, which is off on this server. Start it with DISCORD_DM_RELAY=true, or send without relay_to.",
+        );
+      const text = relay_to ? `${relayHeader(relay_to)}\n${content}` : content;
+      if (relay_to && text.length > MAX_DM_CONTENT)
+        throw new Error(
+          `The DM is ${text.length} characters with the relay header; Discord accepts ${MAX_DM_CONTENT}. Shorten content by ${text.length - MAX_DM_CONTENT}.`,
+        );
       const user = await discord.users.fetch(user_id);
-      const sent = await user.send(content);
+      const sent = await user.send(
+        relay_to ? { content: text, allowedMentions: { parse: [] } } : content,
+      );
+      if (relay_to) await dmRelayStore().record([sent.id], user_id, relay_to);
+      const relayNote = relay_to ? ` Answers will be relayed to user ${relay_to}.` : "";
       return {
         content: [
-          { type: "text", text: `✅ DM sent to ${user.username} (message id: ${sent.id}).` },
+          {
+            type: "text",
+            text: `✅ DM sent to ${user.username} (message id: ${sent.id}).${relayNote}`,
+          },
         ],
       };
     },

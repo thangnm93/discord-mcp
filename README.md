@@ -17,7 +17,7 @@
 
 </div>
 
-> **Fork.** `@thangnm93/discord-mcp` is [PaSympa/discord-mcp](https://github.com/PaSympa/discord-mcp) 2.4.0 plus private threads and thread member tools, proposed upstream in [PR #200](https://github.com/PaSympa/discord-mcp/pull/200): `discord_create_thread` takes `private` and `invitable`, and `discord_add_thread_member` / `discord_remove_thread_member` are new. Use `npx -y @thangnm93/discord-mcp` wherever the commands below say `@pasympa/discord-mcp`. Everything else is upstream.
+> **Fork.** `@thangnm93/discord-mcp` is [PaSympa/discord-mcp](https://github.com/PaSympa/discord-mcp) 2.4.0 plus private threads and thread member tools, proposed upstream in [PR #200](https://github.com/PaSympa/discord-mcp/pull/200): `discord_create_thread` takes `private` and `invitable`, and `discord_add_thread_member` / `discord_remove_thread_member` are new. It also adds a two-way [DM relay](#dm-relay). Use `npx -y @thangnm93/discord-mcp` wherever the commands below say `@pasympa/discord-mcp`. Everything else is upstream.
 
 **discord-mcp** connects Claude, Codex, Cursor, VS Code and any other MCP client to your Discord server through your own bot. Ask in plain language: your assistant reads channels, answers, moderates, and manages roles, channels, forums and events, with 102 tools behind it.
 
@@ -328,21 +328,38 @@ When n8n runs in Docker, `127.0.0.1` is the n8n container itself. Run the server
 - **Allowed hosts.** A request needs a `Host` of `localhost`, `127.0.0.1`, `[::1]` or a name in `DISCORD_MCP_HTTP_ALLOWED_HOSTS`. Any request with an `Origin` header is refused, so a web page cannot reach the server, even through DNS rebinding. nginx forwards its upstream address by default, which passes. Caddy forwards the public hostname: list it.
 - **Stateless.** Each POST to `/mcp` stands alone, and GET and DELETE answer `405`. If a client drops the connection during a call, the Discord action still completes, so a retry can repeat a write.
 
+## DM relay
+
+A bot DM is one-way by default: when several people send DMs through the same bot, an answer stays in the recipient's DM with the bot and never reaches the person who asked. With `DISCORD_DM_RELAY=true`, `discord_send_dm` takes `relay_to`, the Discord user ID of the person the DM is sent for:
+
+1. The DM opens with `📨 From @sender. Reply to this message to answer them.`
+2. When the recipient answers, the bot sends the answer to the sender as a DM, headed `📩 @recipient answered.`, with its attachments, and reacts ✅ on the original.
+3. Either side can keep going by replying to the bot's last message: the relay works in both directions.
+
+A Reply goes to the sender of the message it answers, for 90 days; a Reply to any other message is not relayed. A message sent without Reply goes to the only person who relayed to its author in the last 24 hours; when there are several, the bot asks the author to use Reply instead of guessing. DMs that belong to no relay are ignored, so `discord_read_dms` keeps working as before.
+
+- **Keep the server running.** The relay hears answers only while the process is up, so run it as a long-lived server, typically in http mode. A stdio server started by one client stops with that client.
+- **The relay does not authenticate `relay_to`.** Any caller can name any sender, and in http mode every caller shares one token. Use it where the callers are trusted, or have a gateway in front set `relay_to` for each caller.
+- **What it stores.** `DISCORD_DM_RELAY_STORE` holds message IDs, user IDs and timestamps, never message content. It is written with mode 600.
+- **Intents.** The relay adds the Direct Messages intent, which is not privileged. Message content in DMs reaches the bot without the Message Content intent.
+
 ## Configuration
 
-| Variable                         | Default     | Description                                                                                                                                                                                             |
-| -------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DISCORD_TOKEN`                  | none        | **Required.** Bot token.                                                                                                                                                                                |
-| `DISCORD_MCP_TOOLSETS`           | `all`       | Comma-separated toolsets to expose (see [Expose only what you need](#expose-only-what-you-need)). Unset, empty or `all` exposes every tool.                                                             |
-| `DISCORD_MCP_READ_ONLY`          | `false`     | Set to `true` to expose only the tools annotated `readOnlyHint: true`. Accepts true/false, 1/0, yes/no or on/off; any other value stops the server at startup.                                          |
-| `DISCORD_ALLOWED_GUILDS`         | all         | Comma-separated guild IDs the server may act on. Calls that target any other guild are rejected, whether addressed by guild ID, channel ID, thread ID, webhook or invite code.                          |
-| `DISCORD_MESSAGE_CONTENT`        | `true`      | Set to `false` to stop requesting the Message Content privileged intent at connect time.                                                                                                                |
-| `DISCORD_GUILD_MEMBERS`          | `true`      | Set to `false` to stop requesting the Server Members privileged intent at connect time.                                                                                                                 |
-| `DISCORD_MCP_TRANSPORT`          | `stdio`     | `stdio`, or `http` to serve Streamable HTTP (see [Remote clients over HTTP](#remote-clients-over-http)). Any other value stops the server at startup.                                                   |
-| `DISCORD_MCP_HTTP_TOKEN`         | none        | **Required in http mode.** Bearer token every request must carry: at least 32 characters from the RFC 6750 b64token alphabet (letters, digits, `-._~+/`, trailing `=`), different from `DISCORD_TOKEN`. |
-| `DISCORD_MCP_HTTP_HOST`          | `127.0.0.1` | Address to listen on in http mode.                                                                                                                                                                      |
-| `DISCORD_MCP_HTTP_PORT`          | `3000`      | Port to listen on in http mode.                                                                                                                                                                         |
-| `DISCORD_MCP_HTTP_ALLOWED_HOSTS` | none        | Comma-separated hostnames, without port, accepted in the `Host` header besides `localhost`, `127.0.0.1` and `[::1]`, such as the public name a reverse proxy forwards.                                  |
+| Variable                         | Default                        | Description                                                                                                                                                                                             |
+| -------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DISCORD_TOKEN`                  | none                           | **Required.** Bot token.                                                                                                                                                                                |
+| `DISCORD_MCP_TOOLSETS`           | `all`                          | Comma-separated toolsets to expose (see [Expose only what you need](#expose-only-what-you-need)). Unset, empty or `all` exposes every tool.                                                             |
+| `DISCORD_MCP_READ_ONLY`          | `false`                        | Set to `true` to expose only the tools annotated `readOnlyHint: true`. Accepts true/false, 1/0, yes/no or on/off; any other value stops the server at startup.                                          |
+| `DISCORD_ALLOWED_GUILDS`         | all                            | Comma-separated guild IDs the server may act on. Calls that target any other guild are rejected, whether addressed by guild ID, channel ID, thread ID, webhook or invite code.                          |
+| `DISCORD_MESSAGE_CONTENT`        | `true`                         | Set to `false` to stop requesting the Message Content privileged intent at connect time.                                                                                                                |
+| `DISCORD_GUILD_MEMBERS`          | `true`                         | Set to `false` to stop requesting the Server Members privileged intent at connect time.                                                                                                                 |
+| `DISCORD_MCP_TRANSPORT`          | `stdio`                        | `stdio`, or `http` to serve Streamable HTTP (see [Remote clients over HTTP](#remote-clients-over-http)). Any other value stops the server at startup.                                                   |
+| `DISCORD_MCP_HTTP_TOKEN`         | none                           | **Required in http mode.** Bearer token every request must carry: at least 32 characters from the RFC 6750 b64token alphabet (letters, digits, `-._~+/`, trailing `=`), different from `DISCORD_TOKEN`. |
+| `DISCORD_MCP_HTTP_HOST`          | `127.0.0.1`                    | Address to listen on in http mode.                                                                                                                                                                      |
+| `DISCORD_MCP_HTTP_PORT`          | `3000`                         | Port to listen on in http mode.                                                                                                                                                                         |
+| `DISCORD_MCP_HTTP_ALLOWED_HOSTS` | none                           | Comma-separated hostnames, without port, accepted in the `Host` header besides `localhost`, `127.0.0.1` and `[::1]`, such as the public name a reverse proxy forwards.                                  |
+| `DISCORD_DM_RELAY`               | `false`                        | Set to `true` to relay answers to DMs sent with `relay_to` back to their sender (see [DM relay](#dm-relay)). Accepts true/false, 1/0, yes/no or on/off; any other value stops the server at startup.    |
+| `DISCORD_DM_RELAY_STORE`         | `~/.discord-mcp/dm-relay.json` | File where the DM relay keeps who wrote to whom.                                                                                                                                                        |
 
 The intent flags only change what the bot requests when it connects. Requesting a privileged intent that is not enabled in the Developer Portal closes the connection with code `4014`; set the flag to `false` to connect anyway. What the tools can read is governed by the portal toggles: every message is fetched over the REST API, which Discord gates on the portal setting alone. With Message Content off in the portal, message bodies come back empty (`content`, `embeds`, `attachments`), except the bot's own messages, DMs and messages that mention the bot; with Server Members off, member listing fails.
 
