@@ -73,13 +73,15 @@ export interface RelayState {
   contacts: Record<string, RelayContact[]>;
   /** Messages people wrote that the relay forwarded, kept to hide them from DM reads. */
   sources: Record<string, number>;
+  /** The relay's own notices to people (asking for a Reply, a failed delivery), skipped as answer targets. */
+  notices: Record<string, number>;
 }
 
 export type RelayRoute =
   { kind: "peer"; peer: string } | { kind: "ambiguous"; peers: string[] } | { kind: "none" };
 
 export function emptyRelayState(): RelayState {
-  return { version: 1, links: {}, contacts: {}, sources: {} };
+  return { version: 1, links: {}, contacts: {}, sources: {}, notices: {} };
 }
 
 /**
@@ -105,14 +107,16 @@ export function recordRelay(
  *   message belongs to no relay: guessing would leak an answer meant for someone else.
  * - A plain message is routed only when the bot's latest message in that DM is a relayed
  *   one from the last 24 hours, so an answer to some other bot DM (a notification, a
- *   report) never travels. It goes to that sender, unless several people relayed to the
- *   author within the window: then it is ambiguous.
+ *   report) never travels. `recentBotMessageIds` lists the bot's messages newest first;
+ *   the relay's own notices are skipped by ID, never by content. The message goes to that
+ *   sender, unless several people relayed to the author within the window: then it is
+ *   ambiguous.
  */
 export function resolveRelay(
   state: RelayState,
   author: string,
   replyToId: string | undefined,
-  lastBotMessageId: string | undefined,
+  recentBotMessageIds: string[] | undefined,
   now: number,
 ): RelayRoute {
   if (replyToId) {
@@ -121,6 +125,7 @@ export function resolveRelay(
       ? { kind: "peer", peer: link.peer }
       : { kind: "none" };
   }
+  const lastBotMessageId = recentBotMessageIds?.find((id) => !(id in state.notices));
   const last = lastBotMessageId ? state.links[lastBotMessageId] : undefined;
   if (!last || last.owner !== author || now - last.at > RELAY_WINDOW_MS) return { kind: "none" };
   const recent = (state.contacts[author] ?? []).filter((c) => now - c.at <= RELAY_WINDOW_MS);
@@ -143,6 +148,7 @@ function newest<T>(entries: [string, T][], at: (value: T) => number, now: number
 export function pruneRelay(state: RelayState, now: number): void {
   state.links = newest(Object.entries(state.links), (l) => l.at, now, RELAY_MAX_LINKS);
   state.sources = newest(Object.entries(state.sources), (at) => at, now, RELAY_MAX_LINKS);
+  state.notices = newest(Object.entries(state.notices), (at) => at, now, RELAY_MAX_LINKS);
   for (const [owner, contacts] of Object.entries(state.contacts)) {
     const recent = contacts.filter((c) => now - c.at <= RELAY_WINDOW_MS);
     if (recent.length) state.contacts[owner] = recent;
@@ -167,6 +173,7 @@ export async function loadRelayState(path: string): Promise<RelayState> {
     links: parsed.links,
     contacts: parsed.contacts ?? {},
     sources: parsed.sources ?? {},
+    notices: parsed.notices ?? {},
   };
 }
 
@@ -231,12 +238,19 @@ export class RelayStore {
     await this.save(state);
   }
 
+  /** Marks one of the relay's own notices, so it never counts as the message being answered. */
+  async recordNotice(messageId: string): Promise<void> {
+    const state = await this.current();
+    state.notices[messageId] = this.now();
+    await this.save(state);
+  }
+
   async resolve(
     author: string,
     replyToId: string | undefined,
-    lastBotMessageId?: string,
+    recentBotMessageIds?: string[],
   ): Promise<RelayRoute> {
-    return resolveRelay(await this.current(), author, replyToId, lastBotMessageId, this.now());
+    return resolveRelay(await this.current(), author, replyToId, recentBotMessageIds, this.now());
   }
 
   /** Whether a DM message is part of a relayed conversation: sent for someone, or forwarded. */

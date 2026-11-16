@@ -211,3 +211,12 @@ test("read_dms hides relayed messages unless a gateway header shows the caller i
   assert.equal(shown.messages.length, 3);
   assert.equal(shown.hidden_relayed, undefined);
 });
+
+test("read_dms fails closed when the relay store cannot be read", async () => {
+  process.env.DISCORD_DM_RELAY = "true";
+  stubUser([{ id: "700000000000000009", content: "maybe relayed" }]);
+  mock.method(dmRelayStore(), "isRelayed", async () => {
+    throw new Error("store unreadable");
+  });
+  await assert.rejects(readDms()({ user_id: RECIPIENT }), /store unreadable/);
+});

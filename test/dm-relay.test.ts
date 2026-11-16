@@ -19,13 +19,7 @@ import {
   resolveRelay,
   saveRelayState,
 } from "../src/dmRelayStore.js";
-import {
-  handleRelayDm,
-  isRelayNotice,
-  splitContent,
-  type IncomingDm,
-  type RelayDeps,
-} from "../src/dmRelay.js";
+import { handleRelayDm, splitContent, type IncomingDm, type RelayDeps } from "../src/dmRelay.js";
 
 const SENDER = "111111111111111111";
 const RECIPIENT = "222222222222222222";
@@ -100,7 +94,7 @@ test("a Reply routes until retention ends, and is never guessed after", () => {
 test("a Reply to a message outside the relay is not guessed from recent contacts", () => {
   const state = emptyRelayState();
   recordRelay(state, [MSG], RECIPIENT, SENDER, T0);
-  assert.deepEqual(resolveRelay(state, RECIPIENT, "555555555555555555", MSG, T0 + 10), {
+  assert.deepEqual(resolveRelay(state, RECIPIENT, "555555555555555555", [MSG], T0 + 10), {
     kind: "none",
   });
 });
@@ -108,12 +102,12 @@ test("a Reply to a message outside the relay is not guessed from recent contacts
 test("a plain message goes to the sender of the bot's latest message when it is relayed", () => {
   const state = emptyRelayState();
   recordRelay(state, [MSG], RECIPIENT, SENDER, T0);
-  assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, MSG, T0 + RELAY_WINDOW_MS), {
+  assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, [MSG], T0 + RELAY_WINDOW_MS), {
     kind: "peer",
     peer: SENDER,
   });
   assert.deepEqual(
-    resolveRelay(state, RECIPIENT, undefined, MSG, T0 + RELAY_WINDOW_MS + 1),
+    resolveRelay(state, RECIPIENT, undefined, [MSG], T0 + RELAY_WINDOW_MS + 1),
     { kind: "none" },
     "past the window",
   );
@@ -123,7 +117,7 @@ test("a plain message after some other bot DM is not relayed", () => {
   const state = emptyRelayState();
   recordRelay(state, [MSG], RECIPIENT, SENDER, T0);
   const notification = "999999999999999999";
-  assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, notification, T0 + 10), {
+  assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, [notification, MSG], T0 + 10), {
     kind: "none",
   });
   assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, undefined, T0 + 10), {
@@ -135,7 +129,7 @@ test("a plain message is ambiguous when several people relayed recently, newest 
   const state = emptyRelayState();
   recordRelay(state, ["1"], RECIPIENT, SENDER, T0);
   recordRelay(state, ["2"], RECIPIENT, OTHER, T0 + 10);
-  assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, "2", T0 + 20), {
+  assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, ["2"], T0 + 20), {
     kind: "ambiguous",
     peers: [OTHER, SENDER],
   });
@@ -238,10 +232,19 @@ test("splitContent keeps chunks within the limit and prefers line breaks", () =>
   assert.ok(splitContent("x".repeat(4500)).every((c) => c.length <= 2000));
 });
 
-test("relay notices are recognized, so a plain message looks past them", () => {
-  assert.equal(isRelayNotice("🔁 Several people wrote to you"), true);
-  assert.equal(isRelayNotice("⚠️ I could not deliver this"), true);
-  assert.equal(isRelayNotice("📨 From <@1>."), false);
+test("a plain message looks past the relay's own notices by ID, never by content", () => {
+  const state = emptyRelayState();
+  recordRelay(state, [MSG], RECIPIENT, SENDER, T0);
+  state.notices.notice1 = T0 + 5;
+  assert.deepEqual(resolveRelay(state, RECIPIENT, undefined, ["notice1", MSG], T0 + 10), {
+    kind: "peer",
+    peer: SENDER,
+  });
+  assert.deepEqual(
+    resolveRelay(state, RECIPIENT, undefined, ["alert", MSG], T0 + 10),
+    { kind: "none" },
+    "another bot message, whatever it starts with, stops the relay",
+  );
 });
 
 interface Sent {
@@ -251,10 +254,14 @@ interface Sent {
 
 type Route = Awaited<ReturnType<RelayDeps["store"]["resolve"]>>;
 
-function fakeDeps(route: Route, opts: { failSend?: boolean; failRecord?: boolean } = {}) {
+function fakeDeps(
+  route: Route,
+  opts: { failSend?: boolean; failRecord?: boolean; failSource?: boolean } = {},
+) {
   const sent: Sent[] = [];
   const recorded: { ids: string[]; owner: string; peer: string }[] = [];
   const sources: string[] = [];
+  const notices: string[] = [];
   const resolved: unknown[][] = [];
   let next = 900;
   const deps: RelayDeps = {
@@ -268,8 +275,12 @@ function fakeDeps(route: Route, opts: { failSend?: boolean; failRecord?: boolean
         recorded.push({ ids, owner, peer });
       },
       recordSource: async (id) => {
-        if (opts.failRecord) throw new Error("EROFS: read-only file system");
+        if (opts.failSource) throw new Error("EROFS: read-only file system");
         sources.push(id);
+      },
+      recordNotice: async (id) => {
+        if (opts.failSource) throw new Error("EROFS: read-only file system");
+        notices.push(id);
       },
     },
     sendDm: async (userId, options) => {
@@ -277,9 +288,9 @@ function fakeDeps(route: Route, opts: { failSend?: boolean; failRecord?: boolean
       sent.push({ userId, options });
       return String(next++);
     },
-    lastBotMessageId: async () => MSG,
+    recentBotMessageIds: async () => [MSG],
   };
-  return { deps, sent, recorded, sources, resolved };
+  return { deps, sent, recorded, sources, notices, resolved };
 }
 
 function fakeMessage(opts: {
@@ -297,7 +308,10 @@ function fakeMessage(opts: {
     attachments: new Map((opts.attachments ?? []).map((a, i) => [String(i), a])),
     reference: opts.replyTo ? { messageId: opts.replyTo } : null,
     inGuild: () => opts.guild ?? false,
-    reply: async (text: string) => calls.replies.push(text),
+    reply: async (text: string) => {
+      calls.replies.push(text);
+      return { id: `reply${calls.replies.length}` };
+    },
     react: async (emoji: string) => calls.reactions.push(emoji),
   };
   return { message: message as unknown as IncomingDm, calls };
@@ -323,10 +337,10 @@ test("a Reply resolves without reading history; a plain message passes the bot's
   assert.deepEqual(reply.resolved[0], [RECIPIENT, MSG, undefined]);
   const plain = fakeDeps({ kind: "peer", peer: SENDER });
   await handleRelayDm(fakeMessage({ content: "b" }).message, plain.deps);
-  assert.deepEqual(plain.resolved[0], [RECIPIENT, undefined, MSG]);
+  assert.deepEqual(plain.resolved[0], [RECIPIENT, undefined, [MSG]]);
 });
 
-test("a delivered answer still gets ✅ when the store cannot save it", async () => {
+test("a delivered answer still gets ✅ when the store cannot save its link", async () => {
   const errors = mock.method(console, "error", () => {});
   const { deps, sent } = fakeDeps({ kind: "peer", peer: SENDER }, { failRecord: true });
   const { message, calls } = fakeMessage({ content: "hi" });
@@ -369,13 +383,23 @@ test("a long answer is split, and every part is recorded", async () => {
   assert.deepEqual(recorded[0].ids, ["900", "901"]);
 });
 
-test("an ambiguous plain message asks for a Reply with a notice and forwards nothing", async () => {
-  const { deps, sent } = fakeDeps({ kind: "ambiguous", peers: [OTHER, SENDER] });
+test("an ambiguous plain message asks for a Reply, records the notice, and forwards nothing", async () => {
+  const { deps, sent, notices } = fakeDeps({ kind: "ambiguous", peers: [OTHER, SENDER] });
   const { message, calls } = fakeMessage({ content: "ok" });
   await handleRelayDm(message, deps);
   assert.equal(sent.length, 0);
   assert.match(calls.replies[0], new RegExp(`<@${OTHER}>, <@${SENDER}>.*Use Reply`));
-  assert.equal(isRelayNotice(calls.replies[0]), true);
+  assert.deepEqual(notices, ["reply1"]);
+});
+
+test("nothing is forwarded when the message cannot first be marked as relayed", async () => {
+  mock.method(console, "error", () => {});
+  const { deps, sent } = fakeDeps({ kind: "peer", peer: SENDER }, { failSource: true });
+  const { message, calls } = fakeMessage({ content: "private answer" });
+  await handleRelayDm(message, deps);
+  assert.equal(sent.length, 0, "fails closed: an unmarked message would show in DM reads");
+  assert.match(calls.replies[0], /could not deliver.*cannot save it right now/);
+  assert.deepEqual(calls.reactions, []);
 });
 
 test("bots, server messages and DMs outside a relay are ignored", async () => {
@@ -391,11 +415,12 @@ test("bots, server messages and DMs outside a relay are ignored", async () => {
   assert.equal(sent.length + calls.replies.length, 0);
 });
 
-test("a failed delivery is explained to the author with a notice", async () => {
-  const { deps } = fakeDeps({ kind: "peer", peer: SENDER }, { failSend: true });
+test("a failed delivery is explained to the author with a recorded notice", async () => {
+  const { deps, sources, notices } = fakeDeps({ kind: "peer", peer: SENDER }, { failSend: true });
   const { message, calls } = fakeMessage({ content: "hi" });
   await handleRelayDm(message, deps);
   assert.match(calls.replies[0], /could not deliver.*Cannot send messages to this user/);
-  assert.equal(isRelayNotice(calls.replies[0]), true);
+  assert.deepEqual(notices, ["reply1"]);
+  assert.deepEqual(sources, [INCOMING], "marked before the attempt, so it stays hidden");
   assert.deepEqual(calls.reactions, []);
 });
